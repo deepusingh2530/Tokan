@@ -5,6 +5,21 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-10-22
+
+### Fixed
+- **Gateway dropped connections on simultaneous bursts** — the gateway
+  server inherited the stdlib listen backlog of 5, so when many agents
+  connected at the same instant SYNs were dropped: measured ~246
+  "connection reset by peer" + 109 upstream-fetch failures per 480
+  requests at ~2.4k conn/s (benchmarks/bench_gateway.py scenario B6).
+  The server now listens with a backlog of 128: 480/480 requests succeed
+  at ~1.9k req/s offered load. Found by the benchmark harness.
+
+### Added
+- Regression test: a 30-way concurrent burst through the gateway must
+  lose zero connections
+
 ## [0.2.1] - 2026-10-22
 
 ### Fixed

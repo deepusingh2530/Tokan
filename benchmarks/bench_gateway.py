@@ -123,6 +123,14 @@ class FakeUpstream(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class _BenchServer(ThreadingHTTPServer):
+    """Burst-tolerant: listen() reads the backlog at construction, so it
+    must be a class attribute (setting it on the handler does nothing)."""
+
+    request_queue_size = 128
+    daemon_threads = True
+
+
 # ---------------------------------------------------------------- payloads
 
 def refactor_payload():
@@ -219,6 +227,12 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep gateway running after bench")
     args = ap.parse_args()
 
+    # Line-buffered stdout: results must survive even if a later phase hangs.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:  # pragma: no cover
+        pass
+
     import tokan
 
     print(f"\n=== tokan performance validation ===")
@@ -250,7 +264,7 @@ def main():
 
     # ------------------------------------------------ B: gateway subprocess
     print("\n--- B. gateway end-to-end (fake upstream, 50ms simulated LLM) ---")
-    upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
+    upstream = _BenchServer(("127.0.0.1", 0), FakeUpstream)
     up_port = upstream.server_address[1]
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
@@ -333,17 +347,26 @@ def main():
     # --------------------------------------------------------------- C: MCP
     print("\n--- C. MCP stdio round-trip (installed CLI subprocess) ---")
     mcp = subprocess.Popen([args.cli, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    def rpc(obj):
-        mcp.stdin.write(json.dumps(obj) + "\n"); mcp.stdin.flush()
+
+    def rpc(obj, timeout=10):
+        mcp.stdin.write(json.dumps(obj) + "\n")
+        mcp.stdin.flush()
+        import select
+
+        ready, _, _ = select.select([mcp.stdout], [], [], timeout)
+        if not ready:
+            raise RuntimeError("MCP response timeout")
         return json.loads(mcp.stdout.readline())
+
     init = rpc({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                            "clientInfo": {"name": "bench", "version": "0"}}})
-    tools = rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
+    # Notification: the server correctly sends no response — never read here.
+    mcp.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+    mcp.stdin.flush()
+
     def list_tools():
-        mcp.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n")
-        mcp.stdin.flush()
-        return json.loads(mcp.stdout.readline())
+        return rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
     rpc_list = timed(20, list_tools)
     names = [t["name"] for t in list_tools()["result"]["tools"]]
     record("C1 MCP tools/list round-trip (p95)", pct(rpc_list, 95), "ms", "< 50ms", pct(rpc_list, 95) < 50)

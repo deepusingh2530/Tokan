@@ -9,6 +9,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tokan import OptimizedAgentClient, OptimizationPipeline
 from tokan.proxy import ProxyConfig, TokenOptimizerProxy
 
+
+class _UpstreamServer(ThreadingHTTPServer):
+    """Backlog large enough that fixture bursts test the gateway, not us."""
+
+    request_queue_size = 128
+    daemon_threads = True
+
 # A big, deliberately bloated payload that would normally waste tokens.
 BLOATED_MESSAGES = [
     {"role": "system", "content": "You are an expert software engineer. " * 40},
@@ -61,7 +68,7 @@ class UpstreamFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         FakeUpstream.hits = 0
-        cls.upstream = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
+        cls.upstream = _UpstreamServer(("127.0.0.1", 0), FakeUpstream)
         cls.upstream_port = cls.upstream.server_address[1]
         threading.Thread(target=cls.upstream.serve_forever, daemon=True).start()
 
@@ -206,6 +213,26 @@ class TestProxyGateway(UpstreamFixture):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(req, timeout=5)
         self.assertEqual(ctx.exception.code, 404)
+
+    def test_concurrent_burst_loses_no_connections(self):
+        # Regression: the gateway used the stdlib listen backlog of 5, so a
+        # simultaneous burst got SYN-dropped (~246 resets / 480 requests in
+        # the benchmark). Every request in a burst must be answered.
+        import concurrent.futures
+
+        def one(i):
+            payload = {
+                "model": "gpt-4o",
+                "messages": BLOATED_MESSAGES
+                + [{"role": "user", "content": "burst item %d" % i}],
+            }
+            body, headers = self._post(payload)
+            return headers.get("X-Optimizer-Route")
+
+        with concurrent.futures.ThreadPoolExecutor(30) as ex:
+            routes = list(ex.map(one, range(30)))
+        self.assertEqual(len(routes), 30)
+        self.assertTrue(all(r == "llm" for r in routes), routes)
 
 
 if __name__ == "__main__":

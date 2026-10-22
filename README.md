@@ -9,7 +9,7 @@
 [![PyPI](https://img.shields.io/pypi/v/tokan)](https://pypi.org/project/tokan/)
 [![Python](https://img.shields.io/pypi/pyversions/tokan)](https://pypi.org/project/tokan/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-106%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-107%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
 
 ---
@@ -540,7 +540,7 @@ Tested on representative agent workloads (single session, same context reused):
 **Test methodology**:
 ```bash
 # Run local benchmark suite
-python3 -m unittest discover -s tests  # 106 tests, all pass
+python3 -m unittest discover -s tests  # 107 tests, all pass
 python3 examples/wrap_agent.py         # Offline SDK demo
 python3 tests/fake_upstream.py 8901 &  # Dual-wire upstream
 # Point agents at localhost:4040, check /metrics
@@ -1000,20 +1000,20 @@ pip install -e ".[dev]"
 ### Run Tests
 
 ```bash
-python3 -m unittest discover -s tests           # 106 tests
+python3 -m unittest discover -s tests           # 107 tests
 python3 -m unittest tests.test_adapters         # Single module
 python3 -m pytest tests/ -v                     # With pytest
 ```
 
 ### Test Coverage
 
-Current: **106/106 tests passing (100%)**
+Current: **107/107 tests passing (100%)**
 
 - `test_adapters.py`: 20 tests (registry, detection, snippet rendering)
 - `test_mcp.py`: 14 tests (JSON-RPC, tools, stdio loop)
 - `test_cdm.py`: 13 tests (normalizer, fingerprint, compaction, `compact_text`)
 - `test_copilot_proxy.py`: 13 tests (auth/identity passthrough, `/models`, serve flags)
-- `test_pipeline_and_proxy.py`: 9 tests (end-to-end, streaming, SDK)
+- `test_pipeline_and_proxy.py`: 10 tests (end-to-end, streaming, SDK, burst)
 - `test_cache.py`: 9 tests (local LRU, remote tier, fail-open)
 - `test_anthropic_proxy.py`: 8 tests (Anthropic wire, `count_tokens`, cache)
 - `test_gemini_proxy.py`: 7 tests (generateContent, SSE stream, part preservation)

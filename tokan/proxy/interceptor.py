@@ -548,6 +548,19 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
     return "".join(parts)
 
 
+class _GatewayServer(ThreadingHTTPServer):
+    """Burst-tolerant gateway server.
+
+    The stdlib default backlog of 5 drops SYNs when many agents connect at
+    the same instant (measured: ~246 resets per 480 requests at ~2.4k
+    conn/s in benchmarks/bench_gateway.py scenario B6). ``listen()`` picks
+    the backlog up at construction, so it must be a class attribute.
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class TokenOptimizerProxy:
     """Threaded OpenAI-compatible gateway. Use as a context manager."""
     def __init__(self, config: Optional[ProxyConfig] = None, pipeline: Optional[OptimizationPipeline] = None) -> None:
@@ -560,8 +573,7 @@ class TokenOptimizerProxy:
             pipeline = outer.pipeline
             config = outer.config
 
-        self._server = ThreadingHTTPServer((self.config.host, self.config.port), Handler)
-        self._server.daemon_threads = True
+        self._server = _GatewayServer((self.config.host, self.config.port), Handler)
         self._thread: Optional[threading.Thread] = None
 
     @property
