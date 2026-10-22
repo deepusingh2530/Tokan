@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [
-  { name = "Deepu Singh", email = "deepusingh2530@users.noreply.github.com" }
+  { name = "Deepu Singh", email = "dksingh1130@gmail.com" }
 ]
 keywords = ["llm", "tokens", "proxy", "ai-agents", "mcp", "claude", "cursor", "codex", "aider", "gemini", "optimization", "cache"]
 classifiers = [
