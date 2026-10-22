@@ -632,6 +632,69 @@ locally at **100% savings and 1–3 ms** versus ~1.7–3.7 s upstream. Cache
 keys cover the full payload digest, so a *changed* context is never served a
 stale answer — rows 1 and 4 are misses by design.
 
+### Live scenario tests (v0.3.0 dashboard + receipts)
+
+v0.3.0 ships a live dashboard at `/dashboard` and a persistent sqlite cache.
+The screenshot below is a **real capture** of the dashboard after running the
+11-scenario battery in [`benchmarks/scenarios.py`](benchmarks/scenarios.py)
+against a live Copilot subscription (`gpt-4o-mini`, 12,288-token prompt cap):
+
+![Tokan live dashboard showing all v0.3.0 scenarios](docs/screenshots/dashboard-scenarios.png)
+
+You can read every feature off the screenshot: the **fallback** column shows
+`definitely-not-a-real-model-xyz -> gpt-4o-mini` (the model-fallback retry
+firing and being disclosed), the **PROV.CACHE** column shows `6144` (a real
+provider prompt-cache hit surfaced, never claimed as Tokan's), and the
+**TOKENS / SAVED** columns show the per-request pipeline `original→sent` flow.
+The **LATENCY** column splits each request into Tokan's own overhead and the
+time blocked on the provider generating the answer — a cache hit reads
+`0.39ms (+0.39 tokan)` and a local solve `29.74ms (+29.74 tokan)` (entirely
+Tokan, no upstream call at all), while an LLM route reads
+`1474ms (+1.1 tokan, 1473ms upstream)`. So the seconds you see end-to-end are
+the model generating, not the gateway: Tokan's own overhead is single-digit
+milliseconds on a miss and sub-millisecond on a hit.
+
+**Measured results** (each scenario is a distinct payload; "msg-level" is the
+text actually forwarded, both sides tokenized identically so JSON-framing
+overhead is never misread as compaction):
+
+| # | scenario | status | msg tokens | saved | route | latency |
+|---|---|---:|---:|---:|---|---:|
+| S1 | fresh chat, clean text | 200 | 8 → 8 | 0.0% | `llm` | 1.5 s |
+| S2 | exact repeat of S1 | 200 | 8 → 8 | 100% (cache) | `cache` | **1.2 ms** |
+| S2b | distinct clean text | 200 | 15 → 15 | 0.0% | `llm` | 1.4 s |
+| S3 | noisy tool output (ANSI + 120 log lines) | 200 | 1406 → 1132 | **19.5%** | `llm` | 1.8 s |
+| S4 | whole-file diff, 2-line edit | 200 | 2631 → 100 | **96.2%** | `llm` | 2.1 s |
+| S5 | real git diff over the prompt cap | **400** | 16441 → 16425 | 0.1% | — | 1.6 s |
+| S6 | oversized but rescuable | 200 | 5491 → 4906 | 10.7% | `llm` | 3.4 s |
+| S7 | oversized diff (answered locally) | 200 | 32343 → 32318 | 0.1% | `local` | **31 ms** |
+| S8 | nonexistent model id | 200 | 4 → 4 | 0.0% | `llm` | 2.7 s |
+| S9 | streaming (SSE) | 200 | 10 → 10 | 0.0% | `llm` | 1.4 s |
+| S10 | Anthropic `/v1/messages` wire | **401** | 9 → 9 | 0.0% | — | 0.4 s |
+
+Reading these honestly — including the rows that *don't* save anything:
+
+- **S1/S2b/S9: 0%** — clean text has no waste. Tokan reports the truth rather
+  than inventing a percentage.
+- **S3: 19.5%, S4: 96.2%** — real compaction on noise and diffs. S4 is the
+  diff-compaction win: a whole file echoed back with a 2-line edit loses 96%
+  of its tokens while every `+`/`-` change line is preserved.
+- **S5: 400** — a change-dominated git diff already over the provider's
+  12,288-token cap. There is nothing safe to elide (the changes *are* the
+  payload), so compaction can't rescue it and Copilot rejects it. This is the
+  honest boundary of diff compaction, shown deliberately.
+- **S6: 10.7%** — an oversized payload *with* elidable noise compacts enough to
+  stay under the cap and returns 200.
+- **S7: 27 ms, `local`** — an oversized diff that the JeV router answered via
+  the deterministic local executor without an LLM call (note: this over-triaged
+  a summarization request; it demonstrates the `local` route, not a cache win).
+- **S8: fallback** — the gateway retried once with `gpt-4o-mini` and disclosed
+  it in the `X-Optimizer-Fallback` header and the dashboard.
+- **S10: 401** — the Anthropic wire was exercised, but the gateway holds a
+  Copilot OAuth token, not an Anthropic key, so it correctly refuses to forward
+  Copilot credentials to `api.anthropic.com`. Correct behavior, listed as a
+  limitation rather than hidden.
+
 ---
 
 ## Multi-Agent Deployment

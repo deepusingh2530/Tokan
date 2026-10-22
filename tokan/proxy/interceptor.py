@@ -194,6 +194,7 @@ class _Handler(BaseHTTPRequestHandler):
         route: str,
         status: int,
         ms: float,
+        upstream_ms: float = 0.0,
         upstream_cached: int = 0,
         fallback: str = "",
     ) -> None:
@@ -202,6 +203,13 @@ class _Handler(BaseHTTPRequestHandler):
         This is what makes savings *visible* — every request that passes
         through the gateway leaves a receipt here (and, when ``log_requests``
         is on, a line on the console).
+
+        ``ms`` is end-to-end (request-received to response-sent) and therefore
+        *includes* the provider generating the answer. ``upstream_ms`` isolates
+        the time actually blocked waiting on the provider, so the dashboard can
+        show Tokan's own overhead (``ms - upstream_ms``) separately — otherwise
+        a 5s generation reads as "the gateway is slow" when the gateway added
+        single-digit milliseconds.
         """
         if self.receipts is None:
             return
@@ -209,6 +217,7 @@ class _Handler(BaseHTTPRequestHandler):
         # What actually left the machine: cache/local hits send nothing.
         sent = 0 if route in ("cache", "local") else result.record.canonical_tokens
         saved_pct = round(100.0 * (original - sent) / original, 2) if original else 0.0
+        overhead = max(0.0, ms - upstream_ms)
         rec: Dict[str, Any] = {
             "ts": time.time(),
             "path": self.path,
@@ -219,6 +228,8 @@ class _Handler(BaseHTTPRequestHandler):
             "sent_tokens": sent,
             "saved_pct": saved_pct,
             "ms": round(ms, 2),
+            "upstream_ms": round(upstream_ms, 2),
+            "overhead_ms": round(overhead, 2),
             "digest": result.record.digest[:16],
             "upstream_cached": upstream_cached,
             "fallback": fallback,
@@ -230,6 +241,8 @@ class _Handler(BaseHTTPRequestHandler):
                 f"model={rec['model'] or '-'} {original}->{sent} tok ({saved_pct}%) "
                 f"{rec['ms']}ms"
             )
+            if upstream_ms:
+                line += f" [tokan +{rec['overhead_ms']}ms, upstream {rec['upstream_ms']}ms]"
             if upstream_cached:
                 line += f" upstream_cache={upstream_cached}"
             if fallback:
@@ -276,7 +289,11 @@ class _Handler(BaseHTTPRequestHandler):
             f"<td>{esc(r['original_tokens'])}&rarr;{esc(r['sent_tokens'])}</td>"
             f"<td>{esc(r['saved_pct'])}%</td>"
             f"<td>{esc(r['status'])}</td>"
-            f"<td>{esc(r['ms'])}ms</td>"
+            f"<td>{esc(r['ms'])}ms "
+            f"<span class='lat' title='Tokan overhead vs time blocked on the provider'>"
+            f"(&#43;{esc(r.get('overhead_ms', r['ms']))} tokan"
+            f"{'' if not r.get('upstream_ms') else ', ' + esc(r['upstream_ms']) + ' upstream'})"
+            f"</span></td>"
             f"<td>{esc(r['upstream_cached'])}</td>"
             f"<td>{esc(r['fallback'])}</td>"
             "</tr>"
@@ -298,6 +315,7 @@ class _Handler(BaseHTTPRequestHandler):
  th {{ color:#8b949e; font-size:11px; text-transform:uppercase; }}
  .rt-cache {{ color:#3fb950; }} .rt-local {{ color:#58a6ff; }} .rt-llm {{ color:#d29922; }}
  .empty {{ color:#8b949e; font-style:italic; }}
+ .lat {{ color:#8b949e; font-size:11px; white-space:nowrap; }}
 </style></head><body>
 <h1><span>Tokan</span> Gateway &mdash; {esc(self.config.host)}:{esc(self.config.port)}</h1>
 <div class="cards">
@@ -313,7 +331,7 @@ class _Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">Hit rate</div><div class="v">{esc(c['hit_rate'])}</div></div>
 </div>
 <table>
-<tr><th>Time</th><th>Route</th><th>Model</th><th>Tokens</th><th>Saved</th><th>Status</th><th>Latency</th><th>Prov.cache</th><th>Fallback</th></tr>
+<tr><th>Time</th><th>Route</th><th>Model</th><th>Tokens</th><th>Saved</th><th>Status</th><th title="Total end-to-end. Parenthetical splits Tokan's own overhead from time blocked waiting on the provider to generate the answer.">Latency (tokan / upstream)</th><th>Prov.cache</th><th>Fallback</th></tr>
 {rows}
 </table>
 </body></html>"""
@@ -364,6 +382,7 @@ class _Handler(BaseHTTPRequestHandler):
                 payload, result,
                 route=result.decision.route, status=200,
                 ms=(time.perf_counter() - started) * 1000,
+                upstream_ms=0.0,
             )
             return
 
@@ -599,6 +618,9 @@ class _Handler(BaseHTTPRequestHandler):
         upstream_resp = None
         fallback_note = ""
         last_status, last_detail = 502, "upstream unreachable"
+        # Everything from here to the body-read/stream-relay end is time spent
+        # blocked on the provider generating the answer, not Tokan processing.
+        upstream_start = time.perf_counter()
         for i, (attempt_url, attempt_payload) in enumerate(attempts):
             req = urllib.request.Request(
                 attempt_url, data=json.dumps(attempt_payload).encode("utf-8"),
@@ -621,6 +643,7 @@ class _Handler(BaseHTTPRequestHandler):
                 break
 
         if upstream_resp is None:
+            upstream_ms = (time.perf_counter() - upstream_start) * 1000
             try:
                 err = json.loads(last_detail)
             except ValueError:
@@ -629,6 +652,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._record_receipt(
                 payload, result, route="llm", status=last_status,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
+                upstream_ms=upstream_ms,
                 fallback=fallback_note,
             )
             return
@@ -639,15 +663,19 @@ class _Handler(BaseHTTPRequestHandler):
 
         if payload.get("stream") or endpoint == "generate_content_stream":
             self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
+            # Streaming: the relay loop IS the generation, so it's all upstream.
+            upstream_ms = (time.perf_counter() - upstream_start) * 1000
             self._record_receipt(
                 payload, result, route="llm", status=200,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
+                upstream_ms=upstream_ms,
                 fallback=fallback_note,
             )
             return
 
         with upstream_resp:
             body = upstream_resp.read()
+        upstream_ms = (time.perf_counter() - upstream_start) * 1000
         try:
             parsed = json.loads(body.decode("utf-8"))
         except ValueError:
@@ -655,6 +683,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._record_receipt(
                 payload, result, route="llm", status=502,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
+                upstream_ms=upstream_ms,
                 fallback=fallback_note,
             )
             return
@@ -668,6 +697,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._record_receipt(
             payload, result, route="llm", status=200,
             ms=(time.perf_counter() - started) * 1000 if started else 0.0,
+            upstream_ms=upstream_ms,
             upstream_cached=cached, fallback=fallback_note,
         )
 

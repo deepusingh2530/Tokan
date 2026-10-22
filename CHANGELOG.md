@@ -5,6 +5,18 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Latency split (dashboard + receipts)** — every receipt now records
+  `upstream_ms` (time actually blocked waiting on the provider to generate the
+  answer) alongside end-to-end `ms`, and derives Tokan's own overhead as
+  `ms - upstream_ms`. The dashboard's Latency column renders both
+  (`1474ms (+1.1 tokan, 1473ms upstream)`), and `--log-requests` prints the
+  same split, so a slow model generation is never misread as gateway slowness.
+  Cache and local routes report `upstream_ms=0` — their entire (sub-30 ms)
+  latency is Tokan's own, which is exactly the overhead number that matters.
+
 ## [0.3.0] - 2026-10-23
 
 Five quality-of-life and correctness improvements, all stdlib-only.

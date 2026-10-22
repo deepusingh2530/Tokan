@@ -184,6 +184,12 @@ class TestReceiptsAndDashboard(unittest.TestCase):
             self.assertEqual(r["model"], "m")
             self.assertIn("original_tokens", r)
             self.assertIn("ms", r)
+            # Latency split: total >= upstream, overhead = total - upstream >= 0.
+            # For an LLM route the upstream wait must be > 0 (we called out).
+            self.assertGreater(r["upstream_ms"], 0)
+            self.assertGreaterEqual(r["ms"], r["upstream_ms"])
+            self.assertAlmostEqual(
+                r["overhead_ms"], r["ms"] - r["upstream_ms"], places=1)
         _run(_ChatUpstream, fn=fn)
 
     def test_receipts_record_cache_route_with_zero_sent(self):
@@ -200,6 +206,9 @@ class TestReceiptsAndDashboard(unittest.TestCase):
             r = gw.receipts[-1]
             self.assertEqual(r["route"], "cache")
             self.assertEqual(r["sent_tokens"], 0)   # nothing left the machine
+            # Cache hits never leave the machine: all latency is Tokan's own.
+            self.assertEqual(r["upstream_ms"], 0)
+            self.assertAlmostEqual(r["overhead_ms"], r["ms"], places=1)
         _run(_ChatUpstream, pipeline=pipe, fn=fn)
 
     def test_dashboard_serves_html_with_stats(self):
@@ -212,6 +221,10 @@ class TestReceiptsAndDashboard(unittest.TestCase):
             self.assertIn("Tokan", body)
             self.assertIn("Requests", body)
             self.assertIn("llm", body)  # the receipt row
+            # Latency split is rendered so a slow generation isn't misread as
+            # gateway overhead.
+            self.assertIn("tokan / upstream", body)
+            self.assertIn("tokan", body)
         _run(_ChatUpstream, fn=fn)
 
 
