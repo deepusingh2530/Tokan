@@ -5,6 +5,36 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-10-23
+
+### Added
+- **`benchmarks/ab_copilot.py`** — live A/B harness: the same session sent
+  direct to `api.githubcopilot.com` (exactly what VS Code does without
+  Tokan) and through a fresh-cache gateway on the same Copilot subscription.
+  Billed tokens come from the upstream `usage` block on both legs, so
+  cache/local savings are measured, not estimated. Live results (both in
+  README): gpt-4o-mini session 11,999 → 8,609 tokens (28.3% less) with one
+  provider-rejected oversized payload (400 `model_max_prompt_tokens_exceeded`)
+  returning 200 OK through Tokan after compaction; gpt-4.1 session 27.5%
+  less.
+
+### Fixed
+- **README benchmark section presented fabricated numbers** — the v0.1.0
+  per-agent table (67.1% average reduction, "Cost Saved" column implying
+  $1,545–3,002 per million tokens) predated the benchmark harness and no
+  script in the repo produces it. Replaced with harness-measured results:
+  `bench_gateway.py` 15-check performance table, shape-dependent savings
+  from the live Copilot A/B, and verified cache behavior. The "98% hit rate
+  (semantic digest)" claim was also wrong: whitespace variants hit 100%
+  deterministically via the scrubbed digest, and the n-gram semantic
+  digest is only used by the MCP server, not the gateway serving path.
+  Headline claims updated from "53–78% / 70–85%" to measured ranges.
+- **README architecture diagram** now matches the code: JeV threshold
+  direction (local confidence ≥ 0.88 → "local"), Local Executor scope
+  (line lookups built in; count/AST/symbol handlers pluggable), CDM
+  whitespace handling (blank runs + trailing space; full collapse only on
+  the digest basis), and the scope-keyed digest fact added.
+
 ## [0.2.2] - 2026-10-22
 
 ### Fixed
