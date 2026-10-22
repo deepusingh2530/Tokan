@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Tokan"
+version = "0.1.0"
+description = "Universal token-optimization middleware for AI coding agents: CDM normalization, JeV routing, and a semantic edge cache."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Tokan Contributors" }
+]
+keywords = ["llm", "tokens", "proxy", "ai-agents", "mcp", "claude", "cursor", "codex", "aider", "gemini", "optimization", "cache"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development :: Libraries",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Utilities",
+]
+dependencies = []  # Zero dependencies
+
+[project.urls]
+Homepage = "https://github.com/deepusingh2530/Tokan"
+Documentation = "https://github.com/deepusingh2530/Tokan#readme"
+Repository = "https://github.com/deepusingh2530/Tokan"
+Changelog = "https://github.com/deepusingh2530/Tokan/blob/main/CHANGELOG.md"
+Issues = "https://github.com/deepusingh2530/Tokan/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "black>=23.0", "isort>=5.0", "mypy>=1.0", "ruff>=0.1"]
+
+[project.scripts]
+token-optimizer = "tokan.cli:main"
+
+# Third-party agents extend the adapter registry:
+#   [project.entry-points."tokan.adapters"]
+#   my-agent = "my_pkg.adapter:MyAgentAdapter"
+
+[tool.setuptools.packages.find]
+include = ["tokan*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
