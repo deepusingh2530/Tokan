@@ -270,16 +270,39 @@ Look for issues labeled `good first issue`. These are:
 
 ## Release Process (Maintainers Only)
 
-1. Update `CHANGELOG.md` with release notes
-2. Bump version in `pyproject.toml`
-3. Create release branch: `git checkout -b release/v0.2.0`
-4. Run full test suite
-5. Build distribution: `python3 -m build`
-6. Test locally: `pip install dist/Tokan-0.2.0-py3-none-any.whl`
-7. Tag release: `git tag v0.2.0`
-8. Push: `git push upstream main --tags`
-9. Upload to PyPI: `twine upload dist/*`
-10. Create GitHub release with changelog
+Releases are automated: pushing a `v*` tag runs the **Publish** workflow,
+which re-tests, builds the sdist/wheel, publishes to PyPI via OIDC, and
+attaches a single-file `tokan.pyz` to the GitHub Release.
+
+### One-time setup (PyPI trusted publishing)
+
+1. Create a PyPI account, then go to pypi.org → Account → Publishing
+2. "Add a new pending publisher":
+   - Project name: `tokan`
+   - Owner: `deepusingh2530` · Repository: `Tokan`
+   - Workflow name: `publish.yml` · Environment name: `pypi`
+3. (Optional) create a `pypi` environment in the repo's Settings →
+   Environments with required reviewers, so each release needs a manual
+   approval click.
+
+### Cutting a release
+
+1. Update `CHANGELOG.md` — move `[Unreleased]` items under a new version heading
+2. Bump `version` in `pyproject.toml` **and** `__version__` in `tokan/__init__.py`
+3. Run the suite locally: `python3 -m unittest discover -s tests`
+4. Commit, tag, push:
+
+   ```bash
+   git commit -am "Release v0.2.0"
+   git tag v0.2.0
+   git push origin main v0.2.0
+   ```
+
+5. Verify: `pipx install tokan` picks up the new version; the GitHub Release
+   has the `tokan.pyz` asset.
+
+To rehearse without publishing, build locally:
+`python3 -m build && pip install dist/Tokan-*.whl`.
 
 ## Questions?
 

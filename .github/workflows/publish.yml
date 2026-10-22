@@ -1,0 +1,61 @@
+# Tag-triggered release: test -> build -> publish to PyPI via OIDC ->
+# attach a single-file tokan.pyz zipapp to the GitHub Release.
+#
+# One-time PyPI setup (trusted publishing, no API tokens stored in GitHub):
+#   pypi.org -> Account -> Publishing -> Add pending publisher:
+#     project: tokan | owner: deepusingh2530 | repo: Tokan
+#     workflow: publish.yml | environment: pypi
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m unittest discover -s tests
+
+  publish-pypi:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi # must match the trusted-publisher config on PyPI
+    permissions:
+      id-token: write # OIDC identity — no long-lived tokens anywhere
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade build
+      - run: python -m build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release-zipapp:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release + upload the asset
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build single-file zipapp
+        run: |
+          mkdir _zipapp
+          cp -r tokan _zipapp/
+          python -m zipapp _zipapp -m "tokan.cli:main" -o tokan.pyz
+          python tokan.pyz --help  # sanity check before shipping
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: tokan.pyz
+          generate_release_notes: true

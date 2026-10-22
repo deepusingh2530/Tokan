@@ -34,10 +34,22 @@ Coding agents burn millions of tokens re-reading files, re-parsing directory tre
 ### Install
 
 ```bash
-pip install Tokan
+pipx install tokan          # recommended: isolated CLI install
+# or
+uv tool install tokan       # uv users
+# or
+pip install tokan           # into an existing environment
 ```
 
-Or from source:
+No pip available? Download the single-file `tokan.pyz` from the
+[latest GitHub Release](https://github.com/deepusingh2530/Tokan/releases/latest) —
+it runs on any machine with Python 3.9+:
+
+```bash
+chmod +x tokan.pyz && ./tokan.pyz serve
+```
+
+Or install from source (contributors):
 
 ```bash
 git clone https://github.com/deepusingh2530/Tokan.git

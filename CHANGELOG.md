@@ -5,9 +5,17 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-10-22
 
 ### Added
+
+#### Distribution
+- **PyPI**: `pip install tokan` / `pipx install tokan` — zero-dependency pure
+  wheel, published by a tag-triggered GitHub Actions workflow using OIDC
+  trusted publishing (no API tokens stored in GitHub)
+- **CI matrix**: GitHub Actions tests on Python 3.9–3.14 on every push/PR
+- **Single-file release asset**: `tokan.pyz` zipapp attached to every GitHub
+  Release — runs on any machine with Python 3.9+, no pip required
 
 #### GitHub Copilot support
 - **`github-copilot` adapter** — Copilot CLI BYOK provider env vars, VS Code
@@ -54,7 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unsupported by design (a map that re-includes an ignored path is worse
   than one that omits it)
 
-## [0.1.0] - 2025-10-22
+## [0.1.0] - 2026-10-22
 
 ### Added
 
