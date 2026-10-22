@@ -1,4 +1,4 @@
-"""Unified CLI: ``token-optimizer <command>`` (also ``python -m token_optimizer``).
+"""Unified CLI: ``token-optimizer <command>`` (also ``python -m tokan``).
 
     token-optimizer list                 # adapters + what's installed here
     token-optimizer setup claude-code    # copy-paste wiring for one agent
@@ -23,7 +23,7 @@ def _gateway_info(args: argparse.Namespace) -> GatewayInfo:
     return GatewayInfo.for_gateway(
         args.host,
         args.port,
-        mcp_command=(exe, "-m", "token_optimizer", "mcp"),
+        mcp_command=(exe, "-m", "tokan", "mcp"),
     )
 
 
@@ -89,23 +89,34 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 # -------------------------------------------------------------------- serve
 def cmd_serve(args: argparse.Namespace) -> int:
-    from .proxy.interceptor import ProxyConfig, TokenOptimizerProxy
+    from .proxy.interceptor import ProxyConfig, TokenOptimizerProxy, resolve_upstream_flags
+
+    try:
+        upstream, extra_headers, fallback_headers = resolve_upstream_flags(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     pipeline = _build_pipeline(args)
     config = ProxyConfig(
-        upstream_base=args.upstream,
+        upstream_base=upstream,
         api_key=args.api_key,
         anthropic_upstream=args.anthropic_upstream,
         anthropic_api_key=args.anthropic_api_key,
         host=args.host,
         port=args.port,
+        gemini_upstream=args.gemini_upstream,
+        gemini_api_key=args.gemini_api_key,
+        extra_headers=extra_headers,
+        fallback_headers=fallback_headers,
     )
     proxy = TokenOptimizerProxy(config, pipeline).start()
     gw = _gateway_info(args)
 
     print(f"token-optimizer gateway  {gw.origin}", flush=True)
-    print(f"  openai wire   : {gw.openai_base_url}/chat/completions -> {args.upstream}", flush=True)
+    print(f"  openai wire   : {gw.openai_base_url}/chat/completions -> {upstream}", flush=True)
     print(f"  anthropic wire: {gw.anthropic_base_url}/v1/messages   -> {args.anthropic_upstream}", flush=True)
+    print(f"  gemini wire   : {gw.origin}/v1beta/models/*/generateContent -> {args.gemini_upstream}", flush=True)
     print(f"  mcp command   : {' '.join(gw.mcp_command)}", flush=True)
     print(f"  edge cache    : {args.cdn or 'local LRU only'}", flush=True)
     print(f"  jev threshold : {args.threshold}", flush=True)
@@ -213,12 +224,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup.set_defaults(func=cmd_setup)
 
     def add_gateway_flags(p: argparse.ArgumentParser) -> None:
+        from .proxy.interceptor import add_upstream_flags
+
         p.add_argument("--host", default="127.0.0.1")
         p.add_argument("--port", type=int, default=4040)
         p.add_argument("--upstream", default="https://api.openai.com/v1")
         p.add_argument("--api-key", default=None, help="OpenAI-compatible upstream key")
         p.add_argument("--anthropic-upstream", default="https://api.anthropic.com")
         p.add_argument("--anthropic-api-key", default=None, help="Anthropic upstream key")
+        p.add_argument("--gemini-upstream", default="https://generativelanguage.googleapis.com")
+        p.add_argument("--gemini-api-key", default=None, help="Gemini upstream key")
+        add_upstream_flags(p)
         p.add_argument("--cdn", default=None, help="remote edge-cache endpoint")
         p.add_argument("--namespace", default="default")
         p.add_argument("--threshold", type=float, default=0.88)

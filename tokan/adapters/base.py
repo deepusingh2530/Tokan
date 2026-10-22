@@ -5,8 +5,8 @@ An adapter knows three things about its agent:
   2. whether it is installed (binary on PATH, config file present),
   3. how to wire it to a running gateway (copy-pasteable snippets).
 
-Third-party agents plug in via the ``token_optimizer.adapters`` entry-point
-group — see :mod:`token_optimizer.adapters.registry`.
+Third-party agents plug in via the ``tokan.adapters`` entry-point
+group — see :mod:`tokan.adapters.registry`.
 """
 from __future__ import annotations
 
@@ -27,11 +27,11 @@ class GatewayInfo:
     port: int = 4040
     openai_base_url: str = ""    # e.g. http://127.0.0.1:4040/v1
     anthropic_base_url: str = ""  # e.g. http://127.0.0.1:4040
-    mcp_command: Tuple[str, ...] = ("python3", "-m", "token_optimizer", "mcp")
+    mcp_command: Tuple[str, ...] = ("python3", "-m", "tokan", "mcp")
 
     @classmethod
     def for_gateway(cls, host: str, port: int, mcp_command: Optional[Sequence[str]] = None) -> "GatewayInfo":
-        cmd = tuple(mcp_command) if mcp_command else ("python3", "-m", "token_optimizer", "mcp")
+        cmd = tuple(mcp_command) if mcp_command else ("python3", "-m", "tokan", "mcp")
         return cls(
             host=host,
             port=port,

@@ -127,6 +127,15 @@ class CDMNormalizer:
             lines = head + [marker] + tail
         return "\n".join(self._elide_long_line(line) for line in lines)
 
+    def compact_text(self, text: str) -> str:
+        """Noise-strip one text blob (ANSI, trailing WS, blank runs, elision).
+
+        Public so wire adapters can compact payloads that don't arrive as
+        message lists — e.g. the Gemini API's per-part ``contents`` wire.
+        """
+        text = self._tidy(text)
+        return "\n".join(self._elide_long_line(line) for line in text.splitlines())
+
     # -------------------------------------------------------------- messages
     @staticmethod
     def _content_to_text(content: Any) -> str:

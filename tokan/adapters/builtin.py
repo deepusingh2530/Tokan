@@ -15,16 +15,20 @@ Roo Code                  "OpenAI Compatible" provider base URL
 Continue                  ``~/.continue/config.yaml`` ``baseURL``
 OpenCode (V2)             ``providers`` + ``mcp.servers`` (opencode.json)
 Gemini CLI                ``GOOGLE_GEMINI_BASE_URL`` (Gemini wire) + MCP
+GitHub Copilot            Copilot CLI BYOK env vars / VS Code
+                          ``overrideProxyUrl`` + ``~/.copilot/mcp-config.json``
 Zed                       ``context_servers`` MCP
 Windsurf                  ``mcp_config.json``
 ========================  ================================================
 
 Honest scope notes:
-  * The gateway speaks OpenAI chat-completions and Anthropic Messages.
-    Gemini CLI's ``GOOGLE_GEMINI_BASE_URL`` expects *Gemini* wire, which the
-    gateway does not translate yet — its adapter wires MCP only and says so.
+  * The gateway speaks OpenAI chat-completions, Anthropic Messages, and
+    Gemini generateContent (incl. streamGenerateContent SSE passthrough).
   * Codex defaults to the Responses API; its snippet registers a chat-wire
     provider so requests match what the gateway speaks.
+  * GitHub Copilot's VS Code endpoint override requires a Business/Enterprise
+    plan; the snippet says so and points individual plans at the CLI BYOK
+    env vars instead.
 """
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ from .registry import register
 __all__ = [
     "ClaudeCodeAdapter", "CodexAdapter", "AiderAdapter", "CursorAdapter",
     "ClineAdapter", "RooCodeAdapter", "ContinueAdapter", "OpenCodeAdapter",
-    "GeminiCLIAdapter", "ZedAdapter", "WindsurfAdapter",
+    "GeminiCLIAdapter", "GitHubCopilotAdapter", "ZedAdapter", "WindsurfAdapter",
     "OpenAIGenericAdapter", "AnthropicGenericAdapter",
     "register_builtin_adapters",
 ]
@@ -327,19 +331,19 @@ class OpenCodeAdapter(AgentAdapter):
 class GeminiCLIAdapter(AgentAdapter):
     id = "gemini-cli"
     display_name = "Gemini CLI"
-    protocols = ("mcp",)  # see module docstring: wire passthrough not yet built
+    protocols = ("openai", "mcp")
     executables = ("gemini",)
     config_paths = ("~/.gemini", ".gemini")
-    summary = "MCP tools now; Gemini-wire passthrough is on the roadmap."
+    summary = "Gemini-wire passthrough via GOOGLE_GEMINI_BASE_URL + MCP."
 
     def snippets(self, gw: GatewayInfo) -> List[ConfigSnippet]:
-        note = (
-            "# GOOGLE_GEMINI_BASE_URL exists but expects Gemini wire\n"
-            "# (generateContent), which the gateway does not translate yet.\n"
-            "# MCP below gives Gemini CLI the repo index + cache tools today.\n"
-            f"# export GOOGLE_GEMINI_BASE_URL={gw.anthropic_base_url}  # roadmap"
+        env = (
+            f"export GOOGLE_GEMINI_BASE_URL={gw.origin}\n"
+            "# Gateway serves the Gemini wire at /v1beta/models/*;\n"
+            "# pass a key via GEMINI_API_KEY or gateway --gemini-api-key."
         )
-        return [self._snippet("env", "shell (roadmap note)", note)]
+        return [self._snippet("env", "shell", env,
+                              "Gemini CLI appends /v1beta/models/{model}:generateContent itself.")]
 
     def mcp_target(self) -> str:
         return ".gemini/settings.json → mcpServers (or `gemini mcp add`)"
@@ -395,6 +399,86 @@ class WindsurfAdapter(AgentAdapter):
 
     def snippets(self, gw: GatewayInfo) -> List[ConfigSnippet]:
         return []
+
+
+@register
+class GitHubCopilotAdapter(AgentAdapter):
+    id = "github-copilot"
+    display_name = "GitHub Copilot"
+    protocols = ("openai", "mcp")
+    executables = ("copilot",)
+    config_paths = ("~/.copilot",)
+    summary = "Copilot CLI BYOK env vars, VS Code overrideProxyUrl, MCP."
+
+    def snippets(self, gw: GatewayInfo) -> List[ConfigSnippet]:
+        cli_env = (
+            "# GitHub Copilot CLI — official BYOK provider mode (all plans).\n"
+            "# The CLI appends /chat/completions to the base URL itself.\n"
+            "export COPILOT_PROVIDER_TYPE=openai\n"
+            f"export COPILOT_PROVIDER_BASE_URL={gw.openai_base_url}\n"
+            "export COPILOT_PROVIDER_API_KEY=<upstream key>  # omit if the gateway holds the key\n"
+            "export COPILOT_MODEL=gpt-4.1                    # any model your upstream serves\n"
+            "\n"
+            "copilot"
+        )
+        vscode = (
+            "// VS Code settings.json — route Copilot Chat through the gateway\n"
+            "{\n"
+            '  "github.copilot.advanced": {\n'
+            f'    "debug.overrideProxyUrl": "{gw.openai_base_url}"\n'
+            "  }\n"
+            "}\n"
+            "\n"
+            "# Requires a Copilot Business/Enterprise plan (custom endpoint\n"
+            "# policy); individual plans: use the CLI env vars above, or add\n"
+            "# the gateway as a custom endpoint provider in VS Code instead.\n"
+            "# Reload the window after saving (Developer: Reload Window)."
+        )
+        serve = (
+            "# Gateway side — serve your Copilot plan as the upstream, so\n"
+            "# every Copilot request gets cache + compaction first:\n"
+            "token-optimizer serve --copilot \\\n"
+            '  --api-key "$(gh auth token)"   # or a fine-grained PAT with "Copilot Requests"\n'
+            "\n"
+            "# --copilot            = individual plan (api.githubcopilot.com)\n"
+            '# --copilot business    = api.business.githubcopilot.com\n'
+            '# --copilot enterprise  = api.enterprise.githubcopilot.com'
+        )
+        return [
+            self._snippet("env", "shell (Copilot CLI)", cli_env,
+                          "CLI in provider mode needs no GitHub auth — credentials travel "
+                          "through the gateway's header passthrough."),
+            self._snippet("file", "VS Code settings.json (Copilot Chat)", vscode),
+            self._snippet("command", "gateway (Copilot as upstream)", serve),
+        ]
+
+    def mcp_target(self) -> str:
+        return "~/.copilot/mcp-config.json (or `copilot mcp add`)"
+
+    def mcp_snippet(self, gw: GatewayInfo, *, target: str = "") -> ConfigSnippet:
+        import sys
+
+        cmd = list(gw.mcp_command)
+        if cmd[0] in ("python3", "python"):
+            cmd[0] = sys.executable or cmd[0]
+        entry = json.dumps(
+            {
+                "mcpServers": {
+                    "token-optimizer": {
+                        "type": "local",
+                        "command": cmd[0],
+                        "args": cmd[1:],
+                    }
+                }
+            },
+            indent=2,
+        )
+        return self._snippet(
+            "file",
+            self.mcp_target(),
+            entry,
+            "Or one-shot: copilot mcp add token-optimizer -- " + " ".join(cmd),
+        )
 
 
 @register

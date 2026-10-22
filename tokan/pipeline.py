@@ -3,8 +3,8 @@ from __future__ import annotations
 
 This is the shared core used by *both* integration patterns:
 
-  * :class:`token_optimizer.proxy.TokenOptimizerProxy` (transparent gateway)
-  * :class:`token_optimizer.client.OptimizedAgentClient` (SDK wrapper)
+  * :class:`tokan.proxy.TokenOptimizerProxy` (transparent gateway)
+  * :class:`tokan.client.OptimizedAgentClient` (SDK wrapper)
 
 Flow per request::
 

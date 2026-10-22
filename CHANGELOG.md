@@ -5,6 +5,55 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### GitHub Copilot support
+- **`github-copilot` adapter** — Copilot CLI BYOK provider env vars, VS Code
+  ``overrideProxyUrl`` settings snippet (with the Business/Enterprise plan
+  caveat), gateway serve command, and ``~/.copilot/mcp-config.json`` MCP entry
+  (``copilot mcp add`` one-shot in the snippet note)
+- **Credential passthrough** — client auth (BYOK keys, Copilot OAuth tokens)
+  and identity headers (``Copilot-Integration-Id``, ``Editor-Version``,
+  ``Editor-Plugin-Version``, ``Openai-Organization``, ``Conversation-ID``,
+  ``User-Agent``, ``X-Request-Id``, ``x-api-key``, ``x-goog-api-key``) are
+  forwarded upstream unchanged unless a gateway key is configured for that
+  wire — the gateway key always wins and drops the client credential
+- **``fallback_headers``** on ``ProxyConfig`` — applied only where the client
+  sent no value (stand-in Copilot identity headers for BYOK clients)
+- **``--copilot [PLAN]``** serve flag — points the OpenAI wire at a Copilot
+  plan's API origin (``individual`` | ``business`` | ``enterprise``) and
+  installs fallback identity headers
+- **``--extra-header "Key: Value"``** serve flag (repeatable) — explicit
+  upstream headers that override anything the client sent
+- **``GET /models`` + ``GET /v1/models`` passthrough** — model pickers keep
+  working; the upstream catalog is relayed with the same auth rules
+
+#### Gemini wire passthrough (completes the 0.1.0 preview)
+- **``generateContent`` forwarding** — ``contents`` text parts are compacted
+  in place (new public ``CDMNormalizer.compact_text``); non-text parts
+  (``inline_data``, ``function_call``) and the ``generationConfig`` /
+  ``systemInstruction`` envelope pass through verbatim
+- **``streamGenerateContent`` SSE** — classified, relayed frame-by-frame,
+  and cache-served locally in Gemini SSE shape; extracted answer text (never
+  SSE framing) fills the cache
+- **``--gemini-upstream`` / ``--gemini-api-key``** serve flags; client
+  ``x-goog-api-key`` passes through when no gateway key is set
+- **Gemini CLI adapter upgraded** to openai+mcp — ``GOOGLE_GEMINI_BASE_URL``
+  passthrough is real now, replacing the roadmap note
+
+### Fixed
+- **MCP launch command referenced the renamed module** — ``GatewayInfo``
+  defaulted to ``python -m token_optimizer mcp`` (``ModuleNotFoundError``);
+  now ``python -m tokan mcp`` in defaults, CLI banner, and every snippet
+- **Entry-point group renamed** ``token_optimizer.adapters`` →
+  ``tokan.adapters`` to match the published ``pyproject.toml`` docs
+- **Repo index now respects the root ``.gitignore``** — committed ``AGENTS.md``
+  maps no longer reference local-only build output; ``!`` negations are
+  unsupported by design (a map that re-includes an ignored path is worse
+  than one that omits it)
+
 ## [0.1.0] - 2025-10-22
 
 ### Added
@@ -125,11 +174,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [Unreleased] (planned)
 
 ### Planned
 - OpenAI Responses API (`/v1/responses`) support
 - Real BPE token counting (replace ~chars/4 heuristic)
 - Persistent cache backends (SQLite, Redis, S3)
-- GitHub Copilot CLI adapter
 - Performance optimizations (faster digests, streaming compaction)

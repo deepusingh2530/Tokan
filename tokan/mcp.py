@@ -1,6 +1,6 @@
 """MCP server (stdio): plug the optimizer into any MCP-capable agent.
 
-    token-optimizer mcp           # or: python -m token_optimizer mcp
+    token-optimizer mcp           # or: python -m tokan mcp
 
 Register it once in the agent (see ``token-optimizer setup <agent> --mcp``)
 and the agent gains tools that answer context questions *without* an LLM call:

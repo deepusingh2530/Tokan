@@ -1,11 +1,11 @@
 """Adapter registry: built-ins + third-party entry-point discovery.
 
 Built-in adapters register at import. External packages extend the system
-without touching this codebase by declaring the ``token_optimizer.adapters``
+without touching this codebase by declaring the ``tokan.adapters``
 entry-point group::
 
     # pyproject.toml of your agent's plugin package
-    [project.entry-points."token_optimizer.adapters"]
+    [project.entry-points."tokan.adapters"]
     my-agent = "my_pkg.adapter:MyAgentAdapter"
 
 Discovery is lazy and fail-safe: a broken third-party adapter is skipped, never
@@ -29,7 +29,7 @@ __all__ = [
     "ENTRY_POINT_GROUP",
 ]
 
-ENTRY_POINT_GROUP = "token_optimizer.adapters"
+ENTRY_POINT_GROUP = "tokan.adapters"
 
 _lock = threading.Lock()
 _registry: Dict[str, AgentAdapter] = {}

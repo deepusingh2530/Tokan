@@ -9,12 +9,12 @@
 [![PyPI](https://img.shields.io/pypi/v/Tokan)](https://pypi.org/project/Tokan)
 [![Python](https://img.shields.io/pypi/pyversions/Tokan)](https://pypi.org/project/Tokan)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-75%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-99%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
 
 ---
 
-Tokan intercepts AI coding agent traffic, compacts it through a three-stage optimization pipeline (**CDM → Edge Cache → JeV**), answers what it can without a model, caches what it's already seen, and forwards only the essential residue upstream. **One gateway works with Claude Code, Cursor, Aider, Codex, OpenCode, Cline, Roo Code, Continue, Gemini CLI, and any OpenAI/Anthropic SDK** — zero agent code changes required.
+Tokan intercepts AI coding agent traffic, compacts it through a three-stage optimization pipeline (**CDM → Edge Cache → JeV**), answers what it can without a model, caches what it's already seen, and forwards only the essential residue upstream. **One gateway works with Claude Code, Cursor, Aider, Codex, OpenCode, Cline, Roo Code, Continue, Gemini CLI, GitHub Copilot, and any OpenAI/Anthropic/Gemini SDK** — zero agent code changes required.
 
 ## Why Tokan?
 
@@ -72,6 +72,13 @@ export OPENAI_BASE_URL=http://127.0.0.1:4040/v1
 **Gemini CLI** (Gemini generateContent):
 ```bash
 export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:4040
+```
+
+**GitHub Copilot CLI** (BYOK provider mode — see [Copilot setup](#using-tokan-with-github-copilot)):
+```bash
+export COPILOT_PROVIDER_TYPE=openai
+export COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:4040/v1
+export COPILOT_MODEL=gpt-4.1
 ```
 
 **OpenCode / Continue / Cline / Roo Code**:
@@ -238,6 +245,7 @@ token-optimizer mcp  # runs on stdin/stdout
 | **Roo Code** | OpenAI chat | "OpenAI Compatible" provider | ✅ `mcp_settings.json` | `~/.roo` dir |
 | **Continue** | OpenAI chat | `~/.continue/config.yaml` `baseURL` | ✅ `mcpServers` YAML | `~/.continue` dir |
 | **Gemini CLI** | Gemini generateContent | `GOOGLE_GEMINI_BASE_URL` env | ✅ `.gemini/settings.json` | `~/.gemini` dir, `gemini` binary |
+| **GitHub Copilot** | OpenAI chat (BYOK) | Copilot CLI `COPILOT_PROVIDER_*` env / VS Code `overrideProxyUrl` | ✅ `~/.copilot/mcp-config.json` | `~/.copilot` dir, `copilot` binary |
 | **Zed** | — (MCP only) | — | ✅ `context_servers` | `~/.config/zed` |
 | **Windsurf** | — (MCP only) | — | ✅ `mcp_config.json` | `~/.codeium/windsurf` |
 | **Any OpenAI SDK** | OpenAI chat | `OPENAI_BASE_URL` env var | — | always listed (catch-all) |
@@ -252,6 +260,94 @@ token-optimizer serve --port 4040
 # Isolated caches per team/workflow
 token-optimizer serve --port 4040 --namespace team-frontend
 token-optimizer serve --port 4041 --namespace team-backend
+```
+
+---
+
+## Using Tokan with GitHub Copilot
+
+Copilot is the one agent that authenticates with GitHub OAuth instead of an API key — Tokan handles this with **credential passthrough** (the client's token and identity headers travel upstream untouched unless the gateway holds its own key). Print the exact wiring any time:
+
+```bash
+token-optimizer setup github-copilot
+```
+
+### Path 1: Copilot CLI (works on every plan — official BYOK)
+
+Point Copilot CLI's documented provider mode at the gateway. The CLI appends `/chat/completions` itself:
+
+```bash
+export COPILOT_PROVIDER_TYPE=openai
+export COPILOT_PROVIDER_BASE_URL=http://127.0.0.1:4040/v1
+export COPILOT_PROVIDER_API_KEY=<key>   # omit if the gateway holds the key server-side
+export COPILOT_MODEL=gpt-4.1            # any model your upstream serves
+
+copilot
+```
+
+Two ways to supply credentials:
+
+```bash
+# A) Gateway holds YOUR upstream key (OpenAI, Anthropic, or Copilot):
+token-optimizer serve --api-key "$OPENAI_API_KEY"
+
+# B) Gateway serves YOUR Copilot subscription as the upstream — every
+#    Copilot request then gets cache + compaction before it hits GitHub:
+token-optimizer serve --copilot --api-key "$(gh auth token)"
+# Business/Enterprise plans: --copilot business | --copilot enterprise
+```
+
+`--copilot` targets the Copilot API origin for your plan (`api.githubcopilot.com`, `api.business.…`, `api.enterprise.…`) and supplies fallback identity headers for BYOK clients, which send none. Tokens accepted by `--api-key`: `gh auth token` output, a fine-grained PAT with the **Copilot Requests** permission, or `COPILOT_GITHUB_TOKEN`.
+
+### Path 2: VS Code Copilot Chat (Copilot Business/Enterprise)
+
+Route the built-in chat panel through the gateway — VS Code keeps using its Copilot subscription, Tokan optimizes every request:
+
+```jsonc
+// VS Code settings.json
+{
+  "github.copilot.advanced": {
+    "debug.overrideProxyUrl": "http://127.0.0.1:4040/v1"
+  }
+}
+```
+
+Save, then **Developer: Reload Window**. Start the gateway so its upstream is the Copilot API:
+
+```bash
+token-optimizer serve --copilot --api-key "$(gh auth token)"
+```
+
+In this flow VS Code's own Copilot token arrives at the gateway and is passed straight through — `--api-key` is optional (the gateway then uses its own). Custom endpoint configuration requires a **Copilot Business or Enterprise plan**; GitHub does not enable it for individual plans.
+
+> Individual plans: use Path 1, or add Tokan as a custom OpenAI-compatible endpoint provider in VS Code's chat model picker (VS Code ≥ 1.131 "Custom Endpoint") — the gateway exposes it at `http://127.0.0.1:4040/v1`.
+
+### What gets optimized
+
+Every Copilot chat request flows through the same pipeline as any other agent:
+
+- **CDM compaction** — ANSI noise, trailing whitespace, blank runs, and over-long lines are stripped before the request leaves your machine (Copilot responses come back unchanged).
+- **Edge cache** — repeated context (the common case in agent loops) returns from cache in <5ms at zero cost, never touching GitHub.
+- **`GET /models` passthrough** — model pickers keep working; the gateway relays the upstream catalog.
+- **Streaming** — Copilot's SSE streams are relayed frame-by-frame; the *answer text* (never the SSE framing) lands in the cache for future hits.
+- **Multi-turn identity** — `Conversation-ID`, `Editor-Version`, and `Copilot-Integration-Id` headers travel upstream intact, so Copilot's session continuity and server-side feature flags behave exactly as if Tokan weren't there.
+
+### MCP for Copilot CLI
+
+```bash
+copilot mcp add token-optimizer -- token-optimizer mcp
+# or edit ~/.copilot/mcp-config.json — `token-optimizer setup github-copilot` prints it
+```
+
+The agent then gains `optimize_context`, `repo_index`, `cache_lookup`, `cache_store`, and `session_metrics` tools.
+
+### Custom upstream headers
+
+Any upstream wants non-standard headers? Pass them explicitly (repeatable, overrides the client):
+
+```bash
+token-optimizer serve --extra-header "Copilot-Integration-Id: vscode-chat" \
+                      --extra-header "Openai-Organization: my-org"
 ```
 
 ---
@@ -275,9 +371,14 @@ token-optimizer --help              # All commands and flags
 --host 127.0.0.1                    # Bind address
 --port 4040                         # Listen port
 --upstream URL                      # OpenAI upstream (default https://api.openai.com/v1)
---api-key KEY                       # OpenAI API key
+--api-key KEY                       # OpenAI API key (client keys pass through if unset)
 --anthropic-upstream URL            # Anthropic upstream (default https://api.anthropic.com)
 --anthropic-api-key KEY             # Anthropic API key
+--gemini-upstream URL               # Gemini upstream (default https://generativelanguage.googleapis.com)
+--gemini-api-key KEY                # Gemini API key (x-goog-api-key)
+--copilot [PLAN]                    # Serve a Copilot plan as the OpenAI upstream:
+                                    #   individual (default) | business | enterprise
+--extra-header "Key: Value"         # Extra upstream header (repeatable, overrides client)
 --cdn URL                           # Remote edge cache endpoint
 --namespace NAME                    # Cache namespace (default: "default")
 --threshold 0.88                    # JeV confidence threshold (default 0.88)
@@ -317,9 +418,13 @@ price_per_million_tokens = 2.50
 |----------|---------|
 | `OPENAI_API_KEY` | OpenAI upstream auth (also read by agents) |
 | `ANTHROPIC_API_KEY` | Anthropic upstream auth |
+| `GEMINI_API_KEY` | Gemini upstream auth (read by `serve`; sent as `x-goog-api-key`) |
 | `OPENAI_BASE_URL` | Point OpenAI SDK at Tokan gateway |
 | `ANTHROPIC_BASE_URL` | Point Anthropic SDK / Claude Code at Tokan |
 | `GOOGLE_GEMINI_BASE_URL` | Point Gemini CLI at Tokan |
+| `COPILOT_PROVIDER_BASE_URL` | Point Copilot CLI at Tokan (BYOK provider mode) |
+| `COPILOT_PROVIDER_TYPE` | Set to `openai` when using Tokan with Copilot CLI |
+| `COPILOT_PROVIDER_API_KEY` | Key Copilot CLI sends upstream (may be omitted if the gateway holds it) |
 | `TOKAN_CACHE_ENDPOINT` | Override remote cache endpoint |
 | `TOKAN_NAMESPACE` | Override cache namespace |
 
@@ -423,7 +528,7 @@ Tested on representative agent workloads (single session, same context reused):
 **Test methodology**:
 ```bash
 # Run local benchmark suite
-python3 -m unittest discover -s tests  # 75 tests, all pass
+python3 -m unittest discover -s tests  # 104 tests, all pass
 python3 examples/wrap_agent.py         # Offline SDK demo
 python3 tests/fake_upstream.py 8901 &  # Dual-wire upstream
 # Point agents at localhost:4040, check /metrics
@@ -883,21 +988,25 @@ pip install -e ".[dev]"
 ### Run Tests
 
 ```bash
-python3 -m unittest discover -s tests           # 75 tests
+python3 -m unittest discover -s tests           # 104 tests
 python3 -m unittest tests.test_adapters         # Single module
 python3 -m pytest tests/ -v                     # With pytest
 ```
 
 ### Test Coverage
 
-Current: **75/75 tests passing (100%)**
+Current: **104/104 tests passing (100%)**
 
-- `test_cdm.py`: 16 tests (normalizer, fingerprint, compaction)
-- `test_cache.py`: 12 tests (local LRU, remote tier, fail-open)
-- `test_jev.py`: 8 tests (router, decision logic)
-- `test_pipeline_and_proxy.py`: 18 tests (end-to-end, streaming, SDK)
-- `test_adapters.py`: 14 tests (registry, detection, snippets)
-- `test_mcp.py`: 9 tests (JSON-RPC, tools, stdio loop)
+- `test_adapters.py`: 20 tests (registry, detection, snippet rendering)
+- `test_mcp.py`: 14 tests (JSON-RPC, tools, stdio loop)
+- `test_cdm.py`: 13 tests (normalizer, fingerprint, compaction, `compact_text`)
+- `test_copilot_proxy.py`: 13 tests (auth/identity passthrough, `/models`, serve flags)
+- `test_pipeline_and_proxy.py`: 9 tests (end-to-end, streaming, SDK)
+- `test_cache.py`: 9 tests (local LRU, remote tier, fail-open)
+- `test_anthropic_proxy.py`: 8 tests (Anthropic wire, `count_tokens`, cache)
+- `test_gemini_proxy.py`: 7 tests (generateContent, SSE stream, part preservation)
+- `test_repo_index.py`: 5 tests (gitignore-aware walk, map assembly)
+- `test_jev.py`: 6 tests (router, decision logic)
 
 ### Running Examples
 
@@ -930,7 +1039,7 @@ twine upload dist/*
 Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 **Areas we'd love help with**:
-- Additional agent adapters (Gemini native, Zed, Windsurf, GitHub Copilot, Amp, Crush, etc.)
+- Additional agent adapters (Amp, Crush, Gemini native, etc.)
 - Real BPE token counting (replace `~chars/4` heuristic)
 - Persistent cache backends (SQLite, Redis, S3)
 - Performance optimizations (faster digests, streaming compaction)

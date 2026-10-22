@@ -23,8 +23,8 @@ class TestRegistry(unittest.TestCase):
         ids = {a.id for a in all_adapters()}
         expected = {
             "claude-code", "codex", "aider", "cursor", "cline", "roo-code",
-            "continue", "opencode", "gemini-cli", "zed", "windsurf",
-            "openai-generic", "anthropic-generic",
+            "continue", "opencode", "gemini-cli", "github-copilot", "zed",
+            "windsurf", "openai-generic", "anthropic-generic",
         }
         self.assertTrue(expected.issubset(ids), f"missing: {expected - ids}")
 
@@ -57,7 +57,7 @@ class TestRegistry(unittest.TestCase):
             reg._registry.pop("test-third-party", None)
 
     def test_entry_point_group_declared(self):
-        self.assertEqual(ENTRY_POINT_GROUP, "token_optimizer.adapters")
+        self.assertEqual(ENTRY_POINT_GROUP, "tokan.adapters")
 
     def test_broken_adapter_cannot_break_listing(self):
         # detect_all must survive adapters whose detect() misbehaves.
@@ -104,7 +104,7 @@ class TestGatewayInfo(unittest.TestCase):
     def test_mcp_entry(self):
         entry = GW.mcp_config_entry
         self.assertEqual(entry["command"], "python3")
-        self.assertEqual(entry["args"], ["-m", "token_optimizer", "mcp"])
+        self.assertEqual(entry["args"], ["-m", "tokan", "mcp"])
 
 
 class TestSnippets(unittest.TestCase):
@@ -136,6 +136,32 @@ class TestSnippets(unittest.TestCase):
     def test_codex_mcp_snippet_is_toml(self):
         mcp = CodexAdapter().mcp_snippet(GW)
         self.assertIn("[mcp_servers.token-optimizer]", mcp.body)
+
+    def test_copilot_snippets_cover_cli_vscode_and_gateway(self):
+        from tokan.adapters.builtin import GitHubCopilotAdapter
+
+        adapter = GitHubCopilotAdapter()
+        bodies = {s.target: s.body for s in adapter.snippets(GW)}
+        cli = next(b for t, b in bodies.items() if "Copilot CLI" in t)
+        self.assertIn("COPILOT_PROVIDER_BASE_URL", cli)
+        self.assertIn(GW.openai_base_url, cli)
+        self.assertIn("COPILOT_PROVIDER_TYPE=openai", cli)
+        vscode = next(b for t, b in bodies.items() if "VS Code" in t)
+        self.assertIn("overrideProxyUrl", vscode)
+        self.assertIn(GW.openai_base_url, vscode)
+        self.assertIn("--copilot", "\n".join(bodies.values()))
+
+    def test_copilot_mcp_snippet_is_local_server_shape(self):
+        import sys
+
+        from tokan.adapters.builtin import GitHubCopilotAdapter
+
+        body = GitHubCopilotAdapter().mcp_snippet(GW).body
+        config = json.loads(body)
+        server = config["mcpServers"]["token-optimizer"]
+        self.assertEqual(server["type"], "local")
+        self.assertEqual(server["command"], sys.executable)
+        self.assertEqual(server["args"], ["-m", "tokan", "mcp"])
 
     def test_opencode_provider_shape_matches_v2_docs(self):
         body = OpenCodeAdapter().snippets(GW)[0].body

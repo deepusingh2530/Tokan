@@ -79,6 +79,21 @@ class TestFileTree(unittest.TestCase):
         self.assertLess(len(tree), len(raw))
 
 
+class TestCompactText(unittest.TestCase):
+    def test_strips_noise_and_elides(self):
+        n = CDMNormalizer()
+        out = n.compact_text("hello \x1b[0;31mred\x1b[0m \n\n\n\nworld")
+        self.assertNotIn("\x1b", out)
+        self.assertIn("red", out)
+        self.assertNotIn("\n\n\n", out)  # blank runs collapsed
+
+    def test_long_lines_elided_with_marker(self):
+        n = CDMNormalizer(max_line_chars=50)
+        out = n.compact_text("x" * 500)
+        self.assertIn("[cdm:", out)
+        self.assertLess(len(out), 100)
+
+
 class TestEstimate(unittest.TestCase):
     def test_zero_and_positive(self):
         self.assertEqual(estimate_tokens(""), 0)

@@ -1,4 +1,4 @@
-"""``python -m token_optimizer`` → the unified CLI."""
+"""``python -m tokan`` → the unified CLI."""
 from .cli import main
 
 if __name__ == "__main__":
