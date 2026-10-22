@@ -109,6 +109,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         gemini_api_key=args.gemini_api_key,
         extra_headers=extra_headers,
         fallback_headers=fallback_headers,
+        fallback_model=getattr(args, "fallback_model", None),
+        log_requests=getattr(args, "log_requests", False),
     )
     proxy = TokenOptimizerProxy(config, pipeline).start()
     gw = _gateway_info(args)
@@ -118,9 +120,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print(f"  anthropic wire: {gw.anthropic_base_url}/v1/messages   -> {args.anthropic_upstream}", flush=True)
     print(f"  gemini wire   : {gw.origin}/v1beta/models/*/generateContent -> {args.gemini_upstream}", flush=True)
     print(f"  mcp command   : {' '.join(gw.mcp_command)}", flush=True)
-    print(f"  edge cache    : {args.cdn or 'local LRU only'}", flush=True)
+    print(f"  edge cache    : {args.cdn or 'local LRU only'}"
+          + (f" + sqlite({getattr(args, 'cache_db', None)})" if getattr(args, "cache_db", None) else ""), flush=True)
+    print(f"  fallback model: {getattr(args, 'fallback_model', None) or 'none'}", flush=True)
     print(f"  jev threshold : {args.threshold}", flush=True)
     print(f"  metrics       : {gw.origin}/metrics", flush=True)
+    print(f"  dashboard     : {gw.origin}/dashboard", flush=True)
     print("\nWire an agent:  token-optimizer setup <agent>", flush=True)
 
     import time
@@ -143,6 +148,7 @@ def _build_pipeline(args: argparse.Namespace):
         namespace=getattr(args, "namespace", "default"),
         confidence_threshold=getattr(args, "threshold", 0.88),
         price_per_million_tokens=getattr(args, "price", 2.50),
+        cache_db=getattr(args, "cache_db", None),
     )
 
 
@@ -200,6 +206,8 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"tokens saved  : {session.get('tokens_saved', 0)} ({session.get('saved_pct', 0)}%)")
     print(f"cost saved    : ${session.get('cost_saved_usd', 0)}")
     print(f"cache hit rate: {cache.get('hit_rate', 0)} ({cache.get('entries', 0)} entries)")
+    print(f"provider cache: {session.get('upstream_cached_tokens', 0)} cached tokens (upstream's own)")
+    print(f"fallbacks     : {session.get('fallbacks', 0)}")
     return 0
 
 
@@ -239,6 +247,12 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--namespace", default="default")
         p.add_argument("--threshold", type=float, default=0.88)
         p.add_argument("--price", type=float, default=2.50, help="USD per 1M tokens")
+        p.add_argument("--cache-db", default=None,
+                       help="sqlite file for a persistent edge cache (survives restarts)")
+        p.add_argument("--fallback-model", default=None,
+                       help="retry once with this model on model_not_supported/model_not_found")
+        p.add_argument("--log-requests", action="store_true",
+                       help="print one receipt line per request (route, tokens, latency)")
 
     p_serve = sub.add_parser("serve", help="run the optimization gateway")
     add_gateway_flags(p_serve)

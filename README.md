@@ -9,7 +9,7 @@
 [![PyPI](https://img.shields.io/pypi/v/tokan)](https://pypi.org/project/tokan/)
 [![Python](https://img.shields.io/pypi/pyversions/tokan)](https://pypi.org/project/tokan/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-107%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-127%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
 
 ---
@@ -25,6 +25,11 @@ Coding agents burn millions of tokens re-reading files, re-parsing directory tre
 - **Transparent integration** — point your agent at one URL, keep everything else unchanged
 - **Multi-agent ready** — one gateway instance serves multiple concurrent agents
 - **Protocol-agnostic** — OpenAI chat-completions, Anthropic Messages, *and* Gemini generateContent
+- **Persistent cache** (`--cache-db`) — a WAL-mode sqlite backend lets cache hits survive gateway restarts instead of dying with the process
+- **Live dashboard** (`/dashboard`) — auto-refreshing view of session savings, cache hit rate, and a rolling per-request table; `/metrics` stays the machine interface
+- **Per-request receipts** (`--log-requests`) — one console line per request (route, model, tokens in→out, latency), so savings are visible per request, not just as a session total
+- **Model fallback** (`--fallback-model`) — if the upstream rejects a model id (`model_not_supported`/`model_not_found`), the gateway retries once with a fallback and discloses it via `X-Optimizer-Fallback`; payload errors never trigger a retry
+- **Upstream prompt-cache surfacing** — the provider's own cached-token count is read and surfaced as `X-Optimizer-Upstream-Cached-Tokens`, disclosed as the *provider's* savings, never claimed as Tokan's
 
 ---
 
@@ -401,6 +406,9 @@ token-optimizer --help              # All commands and flags
 --namespace NAME                    # Cache namespace (default: "default")
 --threshold 0.88                    # JeV confidence threshold (default 0.88)
 --price 2.50                        # USD per 1M tokens (for cost metrics)
+--cache-db PATH                     # sqlite file for a persistent edge cache (survives restarts)
+--fallback-model MODEL              # retry once with this model on model_not_supported/model_not_found
+--log-requests                      # print one receipt line per request (route, tokens, latency)
 ```
 
 ---
@@ -460,6 +468,7 @@ Before any request hits the cache or LLM, it's normalized:
 - Excessive whitespace: `   \n\n\n    ` → `\n`
 - Long repeated lines: only first N + last N preserved with elision marker
 - Tool output spam: middle chunk removed, head + tail kept
+- **Unified diffs**: runs of unchanged context lines longer than `2 × diff_context` (default 3) are elided; every `+`/`-` change line and hunk header is kept verbatim. Saves big on whole-file diffs an agent echoes back (measured 96.8% on a whole-file patch) but ~0% on ordinary `git diff` output, which is change-dominated (~79% change lines) — the compaction is honest about never touching real changes.
 
 **Structure preservation** (never touched):
 - Code indentation (real spaces stay)
@@ -1091,6 +1100,7 @@ Current: **107/107 tests passing (100%)**
 - `test_cdm.py`: 13 tests (normalizer, fingerprint, compaction, `compact_text`)
 - `test_copilot_proxy.py`: 13 tests (auth/identity passthrough, `/models`, serve flags)
 - `test_pipeline_and_proxy.py`: 10 tests (end-to-end, streaming, SDK, burst)
+- `test_tier1_v030.py`: 20 tests (persistent cache, receipts + dashboard, diff compaction, prompt-cache surfacing, model fallback)
 - `test_cache.py`: 9 tests (local LRU, remote tier, fail-open)
 - `test_anthropic_proxy.py`: 8 tests (Anthropic wire, `count_tokens`, cache)
 - `test_gemini_proxy.py`: 7 tests (generateContent, SSE stream, part preservation)

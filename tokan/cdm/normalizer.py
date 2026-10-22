@@ -31,6 +31,9 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)"
 _TRAILING_WS_RE = re.compile(r"[ \t]+$", re.MULTILINE)
 _BLANK_RUN_RE = re.compile(r"\n{3,}")
 _WHITESPACE_RUN_RE = re.compile(r"\s+")
+# A unified-diff hunk header: "@@ -a[,b] +c[,d] @@". Anchored per line so we
+# only elide inside real diffs, never in prose that happens to contain "@@ -".
+_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 
 
 def estimate_tokens(text: str) -> int:
@@ -93,20 +96,76 @@ class CDMNormalizer:
     """
 
     ELISION_MARKER = "... [cdm: {n} lines elided] ..."
+    DIFF_ELISION_MARKER = "... [cdm: {n} unchanged diff lines elided] ..."
 
     def __init__(
         self,
         tool_head: int = 40,
         tool_tail: int = 20,
         max_line_chars: int = 2000,
+        diff_context: int = 3,
     ) -> None:
         self.tool_head = tool_head
         self.tool_tail = tool_tail
         self.max_line_chars = max_line_chars
+        # Lines of unchanged context kept around each change in a diff hunk.
+        self.diff_context = max(0, diff_context)
 
     # ------------------------------------------------------------------ text
+    def _compact_diff(self, text: str) -> str:
+        """Elide runs of unchanged context lines inside unified diffs.
+
+        Coding agents ship git diffs constantly, and a multi-file diff is
+        mostly space-prefixed context around a handful of ``+``/``-`` changes.
+        Changes, hunk headers, and file headers are always kept verbatim; long
+        runs of pure context keep their head and tail and elide the middle
+        behind an explicit marker (same never-silently-delete contract as
+        tool-output elision). The model still sees the shape and every change.
+        """
+        if "@@ -" not in text:  # fast path: not diff-shaped
+            return text
+        lines = text.splitlines()
+        out: List[str] = []
+        run: List[str] = []
+        in_hunk = False
+        keep = self.diff_context
+
+        def flush() -> None:
+            if not run:
+                return
+            if len(run) > 2 * keep:
+                omitted = len(run) - 2 * keep
+                out.extend(run[:keep])
+                out.append(self.DIFF_ELISION_MARKER.format(n=omitted))
+                out.extend(run[-keep:])
+            else:
+                out.extend(run)
+            run.clear()
+
+        for line in lines:
+            if _DIFF_HUNK_RE.match(line):
+                flush()
+                in_hunk = True
+                out.append(line)
+            elif not in_hunk:
+                out.append(line)
+            elif line.startswith((" ", "\t")) or line == "":
+                # Context inside a hunk (blank line = stripped context line).
+                run.append(line)
+            elif line.startswith(("+", "-", "\\")):
+                flush()
+                out.append(line)
+            else:
+                # Non-diff line: the hunk (and this diff section) ended.
+                flush()
+                in_hunk = False
+                out.append(line)
+        flush()
+        return "\n".join(out)
+
     def _tidy(self, text: str) -> str:
         text = strip_ansi(text)
+        text = self._compact_diff(text)
         text = _TRAILING_WS_RE.sub("", text)
         text = _BLANK_RUN_RE.sub("\n\n", text)
         return text.strip()

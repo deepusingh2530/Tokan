@@ -5,6 +5,50 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-10-23
+
+Five quality-of-life and correctness improvements, all stdlib-only.
+
+### Added
+- **Persistent cache (`--cache-db`)** — `SqliteStore`, a WAL-mode sqlite
+  backend behind the existing `EdgeCache` store hook. Entries written by one
+  gateway run are served by the next, so repeat-savings survive restarts
+  instead of dying with the process. TTL is enforced with wall-clock time
+  (monotonic clocks are meaningless across a restart); a corrupt or truncated
+  row reads as a cache miss rather than raising.
+- **Live dashboard (`/dashboard`)** — a single auto-refreshing HTML page
+  showing session savings, cache hit rate, provider prompt-cache hits, and a
+  rolling table of the last 40 requests (route, model, tokens in→out, latency,
+  fallback). Human-facing; `/metrics` stays the machine interface.
+- **Per-request receipts (`--log-requests`)** — one console line per request:
+  route, status, model, tokens in→out, savings %, latency, plus any provider
+  cache or fallback event. Every request that passes through the gateway is
+  also recorded in the dashboard's rolling window, so savings are visible per
+  request rather than only as a session aggregate.
+- **Model fallback (`--fallback-model`)** — when the upstream rejects a model
+  id with `model_not_supported` / `model_not_found` (Copilot plan-gates most
+  picker ids; OpenAI 404s unknown ones), the gateway retries once with the
+  configured fallback instead of surfacing the wall. Disclosed, not silent:
+  the response carries `X-Optimizer-Fallback: <requested> -> <used>` and the
+  event is counted in `/metrics`. Payload-shape errors (400 for a missing
+  `messages` array) do **not** trigger a retry — only model-identity failures
+  do, so a genuinely malformed request is never masked.
+
+### Changed
+- **Diff-aware compaction in CDM** — the normalizer detects unified diffs and
+  elides runs of *unchanged context* lines longer than `2 × diff_context`
+  (default `diff_context=3`), keeping the head, tail, and every `+`/`-`
+  change line verbatim behind an explicit marker. Scope is honest and measured:
+  a `git diff` of this repo's own history is change-dominated (~79% change
+  lines) and saves ~0%, while a whole-file diff (an agent echoing a large file
+  with a small edit) drops 96.8% of its tokens. Change lines are never lost.
+- **Upstream prompt-cache surfacing** — the gateway now reads the provider's
+  own cached-token count (OpenAI/Copilot `prompt_tokens_details.cached_tokens`,
+  Anthropic `cache_read_input_tokens`, Gemini `usageMetadata.cachedContentTokenCount`)
+  from both buffered and streamed responses. It surfaces the number as
+  `X-Optimizer-Upstream-Cached-Tokens` and counts it in `/metrics`, disclosed
+  as the *provider's* savings — never claimed as Tokan's.
+
 ## [0.2.3] - 2026-10-23
 
 ### Added

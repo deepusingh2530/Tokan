@@ -31,7 +31,7 @@ from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
 from .jev import JevDecision, JevRouter
 from .metrics import SessionMetrics
 
-__all__ = ["OptimizationPipeline", "PipelineResult", "LocalExecutor"]
+__all__ = ["OptimizationPipeline", "PipelineResult", "LocalExecutor", "upstream_cached_tokens", "usage_cached_tokens"]
 
 
 class LocalExecutor:
@@ -53,6 +53,30 @@ class LocalExecutor:
             if answer is not None:
                 return answer
         return None
+
+
+def usage_cached_tokens(usage: Mapping[str, Any], *, protocol: str = "openai") -> int:
+    """Cached tokens from a *usage block* (works for whole responses and SSE frames)."""
+    if protocol == "gemini":
+        return int(usage.get("cachedContentTokenCount") or 0)
+    if protocol == "anthropic":
+        return int(usage.get("cache_read_input_tokens") or 0)
+    details = usage.get("prompt_tokens_details") or {}
+    return int(details.get("cached_tokens") or 0)
+
+
+def upstream_cached_tokens(response: Mapping[str, Any], *, protocol: str = "openai") -> int:
+    """Tokens the *provider's* own prompt cache answered, across wire formats.
+
+    Anthropic and OpenAI both bill cached input tokens at a steep discount when
+    a stable prefix repeats; the number arrives on the response and today it
+    was simply dropped on the floor. Surfacing it lets ``/metrics`` and the
+    response headers show the full picture (Tokan's compaction *plus* the
+    provider's prefix cache) instead of only our half.
+    """
+    if protocol == "gemini":
+        return usage_cached_tokens(response.get("usageMetadata") or {}, protocol=protocol)
+    return usage_cached_tokens(response.get("usage") or {}, protocol=protocol)
 
 
 def _default_handlers():
@@ -117,11 +141,17 @@ class OptimizationPipeline:
         confidence_threshold: float = 0.88,
         ttl_seconds: int = 3600,
         price_per_million_tokens: float = 2.50,
+        cache_db: Optional[str] = None,
     ) -> "OptimizationPipeline":
         from .cache import CDNConfig
         config = CDNConfig(endpoint=cdn_endpoint, namespace=namespace, ttl_seconds=ttl_seconds)
+        store = None
+        if cache_db:
+            # Persistent tier: cache entries survive gateway restarts.
+            from .cache import SqliteStore
+            store = SqliteStore(cache_db, ttl_seconds=ttl_seconds)
         return cls(
-            cache=EdgeCache(config),
+            cache=EdgeCache(config, store=store),
             router=JevRouter(confidence_threshold=confidence_threshold),
             metrics=SessionMetrics(price_per_million_tokens=price_per_million_tokens),
         )
@@ -238,6 +268,11 @@ class OptimizationPipeline:
             original_tokens=result.record.original_tokens,
             optimized_tokens=prompt_tokens + completion_tokens,
         )
+        cached = upstream_cached_tokens(response, protocol=protocol)
+        if cached:
+            # The provider's own prompt cache — surfaced for visibility, but
+            # never counted as *Tokan's* savings.
+            self.metrics.record_upstream_cached(cached)
         content = self._extract_content(response, protocol=protocol)
         if content:
             # Cache the plain text answer; shaping happens at serve time, so

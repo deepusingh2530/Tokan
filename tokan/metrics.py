@@ -21,6 +21,8 @@ class SessionMetrics:
         self.llm_calls = 0
         self.original_tokens = 0
         self.optimized_tokens = 0
+        self.upstream_cached_tokens = 0  # provider prompt-cache hits (surfaced, not ours)
+        self.fallbacks = 0               # model_not_supported retries via --fallback-model
 
     def record(self, route: str, original_tokens: int, optimized_tokens: int = 0) -> None:
         self.requests += 1
@@ -32,6 +34,17 @@ class SessionMetrics:
             self.llm_calls += 1
         self.original_tokens += max(0, int(original_tokens))
         self.optimized_tokens += max(0, int(optimized_tokens))
+
+    def record_upstream_cached(self, tokens: int) -> None:
+        """Tokens the *provider's* prompt cache answered (billed at a discount).
+
+        Surfaced for visibility only — Tokan did not save these, the upstream
+        did; counting them as Tokan savings would be dishonest.
+        """
+        self.upstream_cached_tokens += max(0, int(tokens))
+
+    def record_fallback(self) -> None:
+        self.fallbacks += 1
 
     @property
     def tokens_saved(self) -> int:
@@ -48,11 +61,17 @@ class SessionMetrics:
         return self.tokens_saved / 1_000_000 * self.price_per_million_tokens
 
     def report(self) -> str:
+        extra = ""
+        if self.upstream_cached_tokens:
+            extra += f" | provider prompt-cache: {self.upstream_cached_tokens} tok"
+        if self.fallbacks:
+            extra += f" | model fallbacks: {self.fallbacks}"
         return (
             f"Session Token Savings: {self.saved_pct:.0f}% | "
             f"Cost Saved: ${self.cost_saved_usd:.2f} | "
             f"Requests: {self.requests} "
             f"(cache {self.cache_hits}, local {self.local_solves}, llm {self.llm_calls})"
+            f"{extra}"
         )
 
     def as_dict(self) -> Dict[str, float]:
@@ -67,6 +86,8 @@ class SessionMetrics:
             "saved_pct": self.saved_pct,
             "cost_saved_usd": round(self.cost_saved_usd, 4),
             "price_per_million_tokens": self.price_per_million_tokens,
+            "upstream_cached_tokens": self.upstream_cached_tokens,
+            "fallbacks": self.fallbacks,
         }
 
     def reset(self) -> None:
@@ -76,3 +97,5 @@ class SessionMetrics:
         self.llm_calls = 0
         self.original_tokens = 0
         self.optimized_tokens = 0
+        self.upstream_cached_tokens = 0
+        self.fallbacks = 0
