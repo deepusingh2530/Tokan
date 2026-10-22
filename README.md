@@ -110,10 +110,12 @@ That's it. Every `POST` to `/v1/chat/completions`, `/v1/messages`, or `/v1beta/m
 │                        Tokan Gateway                                 │
 │                                                                     │
 │  [ CDM Normalizer ]                                                 │
-│    • strip ANSI escapes, collapse whitespace                       │
+│    • strip ANSI escapes, collapse blank runs & trailing space      │
 │    • elide tool output spam (head/tail preservation)                │
 │    • compact file trees, truncate long lines                        │
 │    • deterministic fingerprint (noise-insensitive SHA-256)          │
+│    • digest folds in scope (model, temperature, user) — cached     │
+│      answers never cross models                                     │
 │    • structured content preserved verbatim (Anthropic tool_result,  │
 │      image parts)                                                   │
 │                                                                     │
@@ -125,13 +127,14 @@ That's it. Every `POST` to `/v1/chat/completions`, `/v1/messages`, or `/v1beta/m
 │                                                                     │
 │  [ JeV Router ]  (Jevons Paradox Engine)                            │
 │    • System-1 score: regex features over query + payload shape     │
-│    • threshold 0.88: below → "local", above → "llm"                │
+│    • threshold 0.88: local confidence ≥ 0.88 → "local",            │
+│      below → "llm"                                                  │
 │    • never fabricates: local route only if deterministic executor   │
 │      actually produced the answer                                   │
 │                                                                     │
 │  [ Local Executor ]                                                 │
-│    • deterministic System-0 answers (line lookups, exact counts)   │
-│    • 0 tokens, <1ms latency                                        │
+│    • deterministic System-0 answers (0 tokens, 1–3ms measured)     │
+│    • line lookups built in; count/AST/symbol handlers pluggable    │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
         │
