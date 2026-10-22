@@ -550,6 +550,58 @@ python3 tests/fake_upstream.py 8901 &  # Dual-wire upstream
 # Point agents at localhost:4040, check /metrics
 ```
 
+### Live A/B vs GitHub Copilot (measured, not modeled)
+
+The numbers below are a **real end-to-end A/B** against a live Copilot
+subscription: the same 6 payloads sent twice from the same machine, same
+model, same credential — once **direct** to `api.githubcopilot.com` (exactly
+what VS Code sends without Tokan, gh OAuth token + Copilot identity headers),
+once through a **fresh-cache Tokan gateway** on the same upstream. Billed
+tokens per leg come from the upstream `usage` block both legs return — a
+cache/local leg never reaches upstream, so its 0 is *measured*, not an
+estimate. Reproduce it against your own plan:
+
+```bash
+token-optimizer serve --copilot --api-key "$(gh auth token)" --port 4041
+python3 benchmarks/ab_copilot.py --gateway http://127.0.0.1:4041 --model gpt-4o-mini
+```
+
+**`gpt-4o-mini`** (2026-10-23):
+
+| # | scenario | direct (no Tokan) | via Tokan | saved | route | direct ms | Tokan ms |
+|---|---|---:|---:|---:|---|---:|---:|
+| 1 | task + clean code context | 1477 | 1477 | 0.0% | `llm` | 1859 | 1726 |
+| 2 | bloat-heavy turn, tool output | 7429 | 5628 | 24.2% | `llm` | 2483 | 1875 |
+| 3 | deterministic lookup | 85 | 0 | 100.0% | `local` | 1759 | 1 |
+| 4 | follow-up question (history resent) | 1504 | 1504 | 0.0% | `llm` | 1700 | 1618 |
+| 5 | exact repeat of previous turn | 1504 | 0 | 100.0% | `cache` | 1664 | 3 |
+| 6 | oversized turn — provider **rejects** raw payload | **rejected** (400) | 9537 (200 OK) | request fixed | `llm` | 1772 | 2086 |
+| | **session total** | **11,999** | **8,609** | **28.3%** | | | |
+
+Row 6: Copilot refused the raw 12,990-token payload
+(`model_max_prompt_tokens_exceeded`, 12,288 limit); compaction shrank it to
+9,537 and the same request returned 200 OK.
+
+**`gpt-4.1`** (2026-10-23, higher prompt limit accepts row 6, which Tokan
+still compacts by 26.9%):
+
+| # | scenario | direct (no Tokan) | via Tokan | saved | route | direct ms | Tokan ms |
+|---|---|---:|---:|---:|---|---:|---:|
+| 1 | task + clean code context | 1477 | 1477 | 0.0% | `llm` | 3173 | 3358 |
+| 2 | bloat-heavy turn, tool output | 7429 | 5628 | 24.2% | `llm` | 3689 | 2263 |
+| 3 | deterministic lookup | 85 | 0 | 100.0% | `local` | 1914 | 3 |
+| 4 | follow-up question (history resent) | 1504 | 1504 | 0.0% | `llm` | 2327 | 2005 |
+| 5 | exact repeat of previous turn | 1504 | 0 | 100.0% | `cache` | 2542 | 3 |
+| 6 | oversized turn | 13038 | 9537 | 26.9% | `llm` | 2933 | 2605 |
+| | **session total** | **25,037** | **18,146** | **27.5%** | | | |
+
+Reading the rows honestly: clean chat text shows 0.0% because there is no
+waste to remove (Tokan reports what is actually saved); bloat-heavy tool
+output compacts ~24–27%; deterministic lookups and exact repeats are served
+locally at **100% savings and 1–3 ms** versus ~1.7–3.7 s upstream. Cache
+keys cover the full payload digest, so a *changed* context is never served a
+stale answer — rows 1 and 4 are misses by design.
+
 ---
 
 ## Multi-Agent Deployment
