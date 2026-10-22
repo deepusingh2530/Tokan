@@ -5,6 +5,28 @@ All notable changes to Tokan will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-10-22
+
+### Fixed
+- **JeV routing DoS on huge pasted payloads** — the file-path feature regex
+  (`(?:[\w.-]+/)+…`) backtracked exponentially on long slash-free lines: a
+  single 2MB log/code paste stalled routing for ~19s (measured ~3.9s after
+  CDM compaction). The regex now uses bounded segments, and feature scans
+  only sample the first 64KB of the blob — routing is ~750× faster on that
+  payload (24.9ms worst case) and stays O(1) in payload size. Found by the
+  new `benchmarks/bench_gateway.py` harness (B4 scenario, 2MB payload).
+
+### Added
+- **`benchmarks/bench_gateway.py`** — stdlib-only performance harness: real
+  `token-optimizer serve` subprocess against a fake upstream with simulated
+  LLM latency; covers CDM compaction speed/savings, EdgeCache lookup at 50k
+  entries, gateway miss overhead / cache-hit / local-answer / 2MB-body /
+  SSE-relay / 40-way-concurrency latency and throughput, gateway RSS, MCP
+  stdio round-trip, and CLI startup — each checked against explicit targets,
+  non-zero exit on failure (CI-ready)
+- Regression tests: pathological 2MB blob must route in <250ms; path
+  detection still works within the scan cap
+
 ## [0.2.0] - 2026-10-22
 
 ### Added

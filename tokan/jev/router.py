@@ -66,7 +66,16 @@ _LLM_PATTERNS = [
 ]
 
 _CODE_FENCE_RE = re.compile(r"```")
-_FILE_PATH_RE = re.compile(r"(?:[\w.-]+/)+[\w.-]+\.\w{1,5}")
+# Bounded components: the unbounded form `(?:[\w.-]+/)+[\w.-]+\.\w+` backtracks
+# exponentially on long slash-free lines (~19s on a 2MB paste of long words),
+# which any log dump can contain. Bounding each segment keeps worst-case
+# linear. Realistic paths are far below these limits.
+_FILE_PATH_RE = re.compile(r"(?:[\w.-]{1,100}/){1,6}[\w.-]{1,100}\.\w{1,5}")
+
+# Feature scans only need a sample of the blob, not the whole thing — routing
+# must stay cheap no matter how huge the pasted context is. First 64KB carries
+# the same signals (file trees and headers sit at the top of real payloads).
+_FEATURE_BLOB_CAP = 65_536
 
 
 @dataclass
@@ -147,8 +156,9 @@ class JevRouter:
         total += 3.0
 
         # Long payloads with code lean LLM; tiny lookups lean local.
-        code_blocks = len(_CODE_FENCE_RE.findall(blob)) // 2
-        paths = len(set(_FILE_PATH_RE.findall(blob)))
+        scan = blob if len(blob) <= _FEATURE_BLOB_CAP else blob[:_FEATURE_BLOB_CAP]
+        code_blocks = len(_CODE_FENCE_RE.findall(scan)) // 2
+        paths = len(set(_FILE_PATH_RE.findall(scan)))
         query_len = len(query)
 
         local_score = len(local_hits) * self._local_weight

@@ -61,6 +61,39 @@ class TestJevRouter(unittest.TestCase):
         self.assertIn("route", as_dict)
         self.assertIn("confidence", as_dict)
 
+    def test_routing_stays_fast_on_pathological_2mb_blob(self):
+        # Regression: the file-path regex nested-quantifier backtracked
+        # exponentially (~19s on this payload), so one pasted log dump could
+        # stall the gateway for seconds. Routing must stay cheap.
+        import time
+
+        blob = ("x" * 5000 + "\n") * 420  # ~2MB of long slash-free lines
+        t0 = time.perf_counter()
+        d = self.router.evaluate(
+            [{"role": "user", "content": "Refactor this dump:\n" + blob}]
+        )
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(d.route, "llm")
+        self.assertLess(elapsed, 0.25, f"routing took {elapsed:.2f}s")
+
+    def test_file_paths_still_signal_llm_within_cap(self):
+        # Capping the scan blob must not blind the router: paths near the
+        # top still tip a borderline local-looking query to the LLM.
+        neutral = self.router.evaluate(
+            [{"role": "user", "content": "list all routes"}]
+        )
+        with_paths = self.router.evaluate(
+            [
+                {
+                    "role": "user",
+                    "content": "src/tokan/cli.py tests/test_mcp.py docs/a.md\n"
+                    "list all routes",
+                }
+            ]
+        )
+        self.assertEqual(neutral.route, "local")
+        self.assertEqual(with_paths.route, "llm")
+
 
 if __name__ == "__main__":
     unittest.main()
