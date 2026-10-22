@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <!-- Background gradient -->
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f172a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1e293b;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="tokenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#8b5cf6;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="filterGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#10b981;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#34d399;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="200" cy="200" r="190" fill="url(#bgGrad)" stroke="#3b82f6" stroke-width="3"/>
+
+  <!-- Large T for Tokan -->
+  <g filter="url(#glow)">
+    <text x="200" y="180" font-family="Arial Black, sans-serif" font-size="140" font-weight="900" text-anchor="middle" fill="url(#tokenGrad)">T</text>
+  </g>
+
+  <!-- Token reduction arrows (funnel effect) -->
+  <g transform="translate(200, 260)">
+    <!-- Outer arrows (representing raw tokens) -->
+    <g fill="#64748b" opacity="0.8">
+      <polygon points="-80,-10 -60,-20 -60,0"/>
+      <polygon points="80,-10 60,-20 60,0"/>
+      <polygon points="-50,10 -35,-10 -35,10"/>
+      <polygon points="50,10 35,-10 35,10"/>
+      <polygon points="-20,15 -10,0 -10,15"/>
+      <polygon points="20,15 10,0 10,15"/>
+    </g>
+
+    <!-- Optimized output bar -->
+    <rect x="-30" y="22" width="60" height="12" rx="6" fill="url(#filterGrad)"/>
+
+    <!-- Small token symbol (optimized) -->
+    <text x="0" y="65" font-family="Arial, sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#10b981">tokens</text>
+  </g>
+
+  <!-- Subtle ring accents -->
+  <circle cx="200" cy="200" r="195" fill="none" stroke="#3b82f6" stroke-width="1" opacity="0.3"/>
+  <circle cx="200" cy="200" r="185" fill="none" stroke="#8b5cf6" stroke-width="0.5" opacity="0.2"/>
+
+  <!-- Corner accent dots -->
+  <circle cx="60" cy="60" r="8" fill="#3b82f6" opacity="0.6"/>
+  <circle cx="340" cy="60" r="8" fill="#8b5cf6" opacity="0.6"/>
+  <circle cx="60" cy="340" r="8" fill="#10b981" opacity="0.6"/>
+  <circle cx="340" cy="340" r="8" fill="#34d399" opacity="0.6"/>
+
+  <!-- Text label -->
+  <text x="200" y="350" font-family="Arial, sans-serif" font-size="24" font-weight="700" text-anchor="middle" fill="#e2e8f0" letter-spacing="4">TOKAN</text>
+</svg>
