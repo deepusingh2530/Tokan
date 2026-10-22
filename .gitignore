@@ -82,3 +82,4 @@ Thumbs.db
 .env.*
 PUSH_TO_GITHUB.md
 setup_github.sh
+READY_TO_PUSH.md
