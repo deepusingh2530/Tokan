@@ -80,3 +80,5 @@ Thumbs.db
 *.local.json
 .env
 .env.*
+PUSH_TO_GITHUB.md
+setup_github.sh
