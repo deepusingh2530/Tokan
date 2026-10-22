@@ -9,7 +9,7 @@
 [![PyPI](https://img.shields.io/pypi/v/Tokan)](https://pypi.org/project/Tokan)
 [![Python](https://img.shields.io/pypi/pyversions/Tokan)](https://pypi.org/project/Tokan)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-99%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-104%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
 
 ---
