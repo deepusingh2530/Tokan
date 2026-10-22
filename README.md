@@ -313,6 +313,10 @@ token-optimizer serve --copilot --api-key "$(gh auth token)"
 
 ### Path 2: VS Code Copilot Chat (Copilot Business/Enterprise)
 
+> **Full step-by-step runbook:** [docs/vscode-copilot.md](docs/vscode-copilot.md)
+> — includes the individual-plan path (Cline/Roo/Continue + Copilot CLI BYOK),
+> verification, auto-start, and troubleshooting.
+
 Route the built-in chat panel through the gateway — VS Code keeps using its Copilot subscription, Tokan optimizes every request:
 
 ```jsonc
