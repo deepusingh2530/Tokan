@@ -72,10 +72,18 @@ _CODE_FENCE_RE = re.compile(r"```")
 # linear. Realistic paths are far below these limits.
 _FILE_PATH_RE = re.compile(r"(?:[\w.-]{1,100}/){1,6}[\w.-]{1,100}\.\w{1,5}")
 
-# Feature scans only need a sample of the blob, not the whole thing — routing
-# must stay cheap no matter how huge the pasted context is. First 64KB carries
-# the same signals (file trees and headers sit at the top of real payloads).
+# Feature scans only need a sample of the text, not the whole thing — routing
+# must stay cheap no matter how huge the pasted context is. Head+tail carries
+# the real signals: file trees and headers sit at the top of payloads, the
+# question itself at the bottom.
 _FEATURE_BLOB_CAP = 65_536
+
+
+def _sample(text: str, cap: int = _FEATURE_BLOB_CAP) -> str:
+    if len(text) <= cap:
+        return text
+    half = cap // 2
+    return text[:half] + text[-half:]
 
 
 @dataclass
@@ -144,8 +152,11 @@ class JevRouter:
         query = self._last_user_text(messages)
         blob = self._blob(messages)
 
-        local_hits = [name for name, rx in _LOCAL_PATTERNS if rx.search(query)]
-        llm_hits = [name for name, rx in _LLM_PATTERNS if rx.search(query)]
+        # Pattern scans run on a bounded sample: one pasted megabyte must not
+        # decide how long routing takes.
+        scan_query = _sample(query)
+        local_hits = [name for name, rx in _LOCAL_PATTERNS if rx.search(scan_query)]
+        llm_hits = [name for name, rx in _LLM_PATTERNS if rx.search(scan_query)]
 
         evidence = 0.0
         total = 0.0
@@ -156,7 +167,7 @@ class JevRouter:
         total += 3.0
 
         # Long payloads with code lean LLM; tiny lookups lean local.
-        scan = blob if len(blob) <= _FEATURE_BLOB_CAP else blob[:_FEATURE_BLOB_CAP]
+        scan = _sample(blob)
         code_blocks = len(_CODE_FENCE_RE.findall(scan)) // 2
         paths = len(set(_FILE_PATH_RE.findall(scan)))
         query_len = len(query)

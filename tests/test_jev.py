@@ -74,7 +74,9 @@ class TestJevRouter(unittest.TestCase):
         )
         elapsed = time.perf_counter() - t0
         self.assertEqual(d.route, "llm")
-        self.assertLess(elapsed, 0.25, f"routing took {elapsed:.2f}s")
+        # ~25ms locally; keep margin for slow CI runners. The pre-fix
+        # exponential regex took ~19s on this payload, so 0.5s catches it.
+        self.assertLess(elapsed, 0.5, f"routing took {elapsed:.2f}s")
 
     def test_file_paths_still_signal_llm_within_cap(self):
         # Capping the scan blob must not blind the router: paths near the

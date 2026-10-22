@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **JeV routing DoS on huge pasted payloads** — the file-path feature regex
   (`(?:[\w.-]+/)+…`) backtracked exponentially on long slash-free lines: a
   single 2MB log/code paste stalled routing for ~19s (measured ~3.9s after
-  CDM compaction). The regex now uses bounded segments, and feature scans
-  only sample the first 64KB of the blob — routing is ~750× faster on that
-  payload (24.9ms worst case) and stays O(1) in payload size. Found by the
+  CDM compaction). The regex now uses bounded segments, and all feature
+  scans (query patterns + blob signals) run on a bounded head+tail sample —
+  routing is ~750× faster on that payload (~25ms blob scan locally) and
+  stays O(1) in payload size. Found by the
   new `benchmarks/bench_gateway.py` harness (B4 scenario, 2MB payload).
 
 ### Added
