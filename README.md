@@ -20,9 +20,8 @@ Tokan intercepts AI coding agent traffic, compacts it through a three-stage opti
 
 Coding agents burn millions of tokens re-reading files, re-parsing directory trees, replaying bloated histories, and resending identical context. Tokan eliminates that waste:
 
-- **53–78% token reduction** in typical agent sessions (see [Benchmarks](#benchmarks))
-- **70–85% cost savings** via semantic caching (identical context = instant cache hit)
-- **Zero-latency cache hits** — no upstream LLM call, response in <5ms
+- **24–59% token compaction** on noise-heavy agent turns (tool output, ANSI, log spam) and **100% savings** on repeated or deterministic turns — 27.5–28.3% measured across real mixed sessions (see [Benchmarks](#benchmark-results))
+- **Instant cache hits** — identical context answered in 1–3ms with zero upstream tokens
 - **Transparent integration** — point your agent at one URL, keep everything else unchanged
 - **Multi-agent ready** — one gateway instance serves multiple concurrent agents
 - **Protocol-agnostic** — OpenAI chat-completions, Anthropic Messages, *and* Gemini generateContent
@@ -523,26 +522,45 @@ Zero-token, sub-millisecond answers for trivially deterministic queries:
 
 ## Benchmark Results
 
-Tested on representative agent workloads (single session, same context reused):
+Every number below is **measured** by the harnesses committed in
+[`benchmarks/`](benchmarks/) — nothing here is estimated by hand. Run them
+yourself; they exit non-zero if a target is missed.
 
-| Scenario | Agent | Payload Size | Tokens Saved | Cost Saved | Latency (cache hit) |
-|----------|-------|--------------|--------------|------------|---------------------|
-| Refactor monolith | Claude Code | 12,487 tokens | 67.3% | $14.29 | 3ms |
-| Fix bug (same file) | Cursor | 4,210 tokens | 78.1% | $9.87 | 2ms |
-| Code review loop | Aider | 8,934 tokens | 61.2% | $8.45 | 4ms |
-| Test generation | Codex | 6,112 tokens | 72.8% | $7.64 | 3ms |
-| Multi-file refactor | OpenCode | 15,230 tokens | 74.5% | $18.43 | 5ms |
-| Documentation pass | Cline | 3,876 tokens | 55.9% | $5.12 | 2ms |
-| Refactor + tests | Roo Code | 9,105 tokens | 69.8% | $10.23 | 4ms |
-| Architecture Q&A | Continue | 5,540 tokens | 82.3% | $12.67 | 3ms |
-| File tree exploration | Gemini CLI | 2,890 tokens | 45.1% | $2.98 | 2ms |
+### Pipeline performance (`benchmarks/bench_gateway.py`, 15/15 checks)
 
-**Average across all agents**: 67.1% token reduction, 73.2% cost savings, 3.2ms cache latency.
+| Property | Measured |
+|---|---|
+| CDM savings, noise-heavy payload (ANSI + blank runs + log spam) | **58.7%** |
+| Cache hit latency (p95) | **1.21 ms** |
+| Cache miss overhead (p95) | 6.79 ms |
+| Local deterministic answer (p95) | 0.34 ms |
+| 2 MB pathological payload, routed | 106 ms (worst case) |
+| SSE stream relay overhead | +0.15 ms |
+| 40-thread concurrency burst | **0 errors**, ~1,550 req/s |
+| EdgeCache lookup @ 50k entries | <0.01 ms |
+| Gateway RSS after full suite | 44.8 MB |
+| CLI cold start | 40 ms |
 
-**Cache hit rates** (repeated context in same session):
-- Identical queries: 100% hit rate, <5ms
-- Same query, different whitespace: 98% hit rate (semantic digest)
-- Same query, different model: 0% hit (scope isolation)
+### Where the token savings actually come from
+
+Measured on live Copilot traffic (see [Live A/B](#live-ab-vs-github-copilot-measured-not-modeled) below) — savings are **shape-dependent**, and
+Tokan reports honestly rather than inflating:
+
+| Payload shape | Token reduction |
+|---|---|
+| Clean chat / code text | ~0% — no waste to remove |
+| Agent turn carrying tool output (ANSI, log spam, blank runs) | **24–59%** (24.2% realistic tool output; 58.7% pure noise) |
+| Exact repeat of a previous turn | **100%** (edge cache, 1–3 ms) |
+| Deterministic lookup (line numbers, counts) | **100%** (local executor, no LLM call) |
+| Oversized payload over the provider's prompt limit | request **fixed** (compaction brings it under the limit) |
+| Whole mixed session, real Copilot A/B | **27.5–28.3%** |
+
+### Cache behavior (verified)
+
+- Identical queries: **100% hit rate, 1–3 ms** — deterministic digest, not probabilistic
+- Same query, different whitespace / indentation / line breaks: **100% hit** (whitespace-scrubbed digest)
+- Same query, different model: **0% hit** — scope isolation (`model`, `temperature`, `top_p`, `user` are part of the digest)
+- Changed context: **0% hit by design** — a modified request never receives a stale answer
 
 **Test methodology**:
 ```bash
