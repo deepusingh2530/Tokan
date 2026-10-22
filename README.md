@@ -6,8 +6,8 @@
 
 **Universal token-optimization middleware for AI coding agents.**
 
-[![PyPI](https://img.shields.io/pypi/v/Tokan)](https://pypi.org/project/Tokan)
-[![Python](https://img.shields.io/pypi/pyversions/Tokan)](https://pypi.org/project/Tokan)
+[![PyPI](https://img.shields.io/pypi/v/tokan)](https://pypi.org/project/tokan/)
+[![Python](https://img.shields.io/pypi/pyversions/tokan)](https://pypi.org/project/tokan/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests](https://img.shields.io/badge/tests-104%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
