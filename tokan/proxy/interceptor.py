@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+from ..cdm import estimate_tokens
+from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
 from ..session import SESSION_HEADER
 
@@ -183,12 +185,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _route_headers(self, result: PipelineResult) -> Dict[str, str]:
-        return {
+        out = {
             "X-Optimizer-Route": result.decision.route,
             "X-Optimizer-Saved-Tokens": str(result.record.saved_tokens),
             "X-Optimizer-Saved-Percent": str(result.record.saved_pct),
             "X-Optimizer-Digest": result.record.digest[:16],
         }
+        # Doc Governor: disclose the retrieval economics on every response
+        # (including streams, whose body is SSE chunks we don't rewrite).
+        ds = result.doc_savings
+        if ds:
+            sent = 0 if result.decision.route in ("cache", "local") else result.record.canonical_tokens
+            avoided = max(0, int(ds.get("full_tokens", 0)) - sent)
+            out["X-Optimizer-Doc-Id"] = str(ds.get("doc_id", ""))
+            out["X-Optimizer-Doc-Avoided-Tokens"] = str(avoided)
+        return out
 
     # ------------------------------------------------------------- receipts
     def _record_receipt(
@@ -218,7 +229,10 @@ class _Handler(BaseHTTPRequestHandler):
         """
         if self.receipts is None:
             return
-        original = result.record.original_tokens
+        # Doc Governor: doc asks are measured against the naive full-document
+        # resend (what the client would have paid without retrieval).
+        ds = result.doc_savings
+        original = int(ds.get("full_tokens", 0)) if ds else result.record.original_tokens
         # What actually left the machine: cache/local hits send nothing.
         sent = 0 if route in ("cache", "local") else result.record.canonical_tokens
         saved_pct = round(100.0 * (original - sent) / original, 2) if original else 0.0
@@ -244,6 +258,7 @@ class _Handler(BaseHTTPRequestHandler):
             "provider_cache_ratio": cache_ratio,
             "prefix_reused": prefix_reused,
             "session": pr.session_key if pr else "",
+            "doc_id": ds.get("doc_id", "") if ds else "",
             "fallback": fallback,
         }
         self.receipts.append(rec)
@@ -257,6 +272,8 @@ class _Handler(BaseHTTPRequestHandler):
                 line += f" [tokan +{rec['overhead_ms']}ms, upstream {rec['upstream_ms']}ms]"
             if prefix_reused:
                 line += f" prefix_reuse={prefix_reused}"
+            if ds:
+                line += f" doc={ds['doc_id']} avoided={max(0, original - sent)}tok"
             if upstream_cached:
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
@@ -295,13 +312,18 @@ class _Handler(BaseHTTPRequestHandler):
         def esc(value: Any) -> str:
             return html_mod.escape(str(value))
 
+        def doc_tag(r: Dict[str, Any]) -> str:
+            # Marks rows whose savings are measured against the full-document
+            # resend baseline (Doc Governor) rather than payload compaction.
+            return " <span class=lat title='doc ask'>doc</span>" if r.get("doc_id") else ""
+
         rows = "".join(
             "<tr>"
             f"<td>{esc(time.strftime('%H:%M:%S', time.localtime(r['ts'])))}</td>"
             f"<td class='rt-{esc(r['route'])}'>{esc(r['route'])}</td>"
             f"<td>{esc(r['model'])}</td>"
             f"<td>{esc(r['original_tokens'])}&rarr;{esc(r['sent_tokens'])}</td>"
-            f"<td>{esc(r['saved_pct'])}%</td>"
+            f"<td>{esc(r['saved_pct'])}%{doc_tag(r)}</td>"
             f"<td>{esc(r['status'])}</td>"
             f"<td>{esc(r['ms'])}ms "
             f"<span class='lat' title='Tokan overhead vs time blocked on the provider'>"
@@ -344,6 +366,9 @@ class _Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">Provider cache</div><div class="v" title="Tokens the provider's own prompt cache answered (its discount, not Tokan's)">{esc(m['upstream_cached_tokens'])}</div></div>
  <div class="card"><div class="k">Cache ratio</div><div class="v" title="Share of upstream prompt tokens served from the provider's prompt cache">{esc(round(100 * m.get('provider_cache_ratio', 0), 1))}%</div></div>
  <div class="card"><div class="k">Prefix reuse</div><div class="v" title="Tokens repeating the previous turn's prefix — the base the provider discounts (kept stable by Tokan)">{esc(m.get('prefix_reused_tokens', 0))}</div></div>
+ <div class="card"><div class="k">Docs</div><div class="v" title="Documents ingested — stored once, reused by every question">{esc(m.get('doc_ingests', 0))}</div></div>
+ <div class="card"><div class="k">Doc Q&amp;A</div><div class="v" title="Document questions answered from summary + retrieved excerpts">{esc(m.get('doc_questions', 0))}</div></div>
+ <div class="card"><div class="k">Doc avoided</div><div class="v" title="Tokens never sent because retrieval replaced the full-document resend (baseline = whole doc + question)">{esc(m.get('doc_tokens_avoided', 0))}</div></div>
  <div class="card"><div class="k">Fallbacks</div><div class="v">{esc(m['fallbacks'])}</div></div>
  <div class="card"><div class="k">Cache entries</div><div class="v">{esc(c['entries'])}</div></div>
  <div class="card"><div class="k">Hit rate</div><div class="v">{esc(c['hit_rate'])}</div></div>
@@ -362,7 +387,11 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         protocol, endpoint = self._classify(self.path)
-        if protocol is None:
+        # Doc Governor extensions are Tokan's own endpoints, not provider
+        # wires — recognized before the protocol classifier 404s them.
+        is_ingest = self.path in ("/v1/ingest", "/ingest")
+        is_doc_ask = self.path in ("/v1/doc/ask", "/doc/ask")
+        if protocol is None and not (is_ingest or is_doc_ask):
             self._send_json(404, {"error": {"message": f"unknown path {self.path}", "type": "invalid_request_error"}})
             return
         try:
@@ -373,6 +402,20 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
             return
 
+        if is_ingest:
+            self._handle_ingest(payload)
+            return
+
+        doc_savings: Optional[Dict[str, Any]] = None
+        if is_doc_ask:
+            assembled = self._assemble_doc_ask(payload)
+            if assembled is None:
+                return  # error response already sent
+            payload, doc_savings = assembled
+            # Retrieval produces a standard OpenAI-wire prompt; everything
+            # downstream (cache, receipts, fallback, session) just runs.
+            protocol, endpoint = "openai", "chat"
+
         if endpoint == "count_tokens":
             # Anthropic bookkeeping endpoint — answer locally, zero tokens.
             self._send_json(200, self._count_tokens(payload))
@@ -381,14 +424,21 @@ class _Handler(BaseHTTPRequestHandler):
         started = time.perf_counter()
         # Session Governor: an explicit X-Optimizer-Session header names the
         # conversation; otherwise the key is derived from the message root.
+        # Doc asks group under the document so prefix reuse is per-document.
         session_key = (self.headers.get(SESSION_HEADER) or "").strip() or None
+        if doc_savings is not None:
+            session_key = f"doc:{doc_savings['doc_id']}"
         result = self.pipeline.prepare(payload, protocol=protocol, session_key=session_key)
+        if doc_savings is not None:
+            result.doc_savings = doc_savings
 
         # 1) Cache hit / deterministic local answer: zero upstream tokens.
         if result.can_serve_locally:
             response = self.pipeline.serve_local(
                 result, model=str(payload.get("model", "optimizer-local")), protocol=protocol
             )
+            if doc_savings is not None:
+                response["optimizer"] = self._doc_meta(result)
             wants_stream = bool(payload.get("stream")) or endpoint == "generate_content_stream"
             if wants_stream:
                 if protocol == "anthropic":
@@ -444,6 +494,128 @@ class _Handler(BaseHTTPRequestHandler):
             for m in messages
         )
         return {"input_tokens": estimate_tokens(blob)}
+
+    # ---------------------------------------------------------- Doc Governor
+    def _handle_ingest(self, payload: Dict[str, Any]) -> None:
+        """``POST /v1/ingest`` — store a document once, get a ``doc_id`` back.
+
+        Chunking, TF-IDF indexing and the extractive summary all happen here,
+        so every later question only pays for retrieval, not for re-sending
+        (or re-reading) the document.
+        """
+        text = payload.get("text", payload.get("document", ""))
+        if not isinstance(text, str) or not text.strip():
+            self._send_json(400, {
+                "error": {"message": "missing or empty 'text' field "
+                                     '(expected {"text": "<document>"} or {"document": "<document>"})',
+                          "type": "invalid_request_error"},
+            })
+            return
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        doc_id = str(payload.get("doc_id") or "").strip() or None
+        try:
+            doc = self.pipeline.documents.ingest(text, metadata=metadata, doc_id=doc_id)
+        except ValueError as exc:
+            self._send_json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+            return
+        self.pipeline.metrics.record_ingest(doc.chunk_count, doc.total_tokens)
+        if self.config.log_requests:
+            print(
+                f"{time.strftime('%H:%M:%S')} POST /v1/ingest doc={doc.doc_id} "
+                f"{doc.chunk_count} chunks {doc.total_tokens}tok "
+                f"(summary {doc.summary_tokens}tok)",
+                flush=True,
+            )
+        self._send_json(200, {
+            "doc_id": doc.doc_id,
+            "chunks": doc.chunk_count,
+            "total_tokens": doc.total_tokens,
+            "summary_tokens": doc.summary_tokens,
+            "summary": doc.summary,
+            "metadata": doc.metadata,
+            "next": 'POST /v1/doc/ask {"doc_id": "...", "question": "...", "model": "..."}',
+        })
+
+    def _assemble_doc_ask(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Retrieve + assemble the compact prompt for one document question.
+
+        Returns ``(assembled_payload, doc_savings)``; sends the error response
+        and returns ``None`` when the request cannot be served (unknown doc,
+        missing question, missing model).
+        """
+        def _err(status: int, message: str):
+            self._send_json(status, {"error": {"message": message, "type": "invalid_request_error"}})
+            return None
+
+        doc_id = str(payload.get("doc_id") or "").strip()
+        if not doc_id:
+            return _err(400, "missing 'doc_id' — ingest a document first via POST /v1/ingest")
+        doc = self.pipeline.documents.get(doc_id)
+        if doc is None:
+            return _err(404, f"unknown doc_id {doc_id!r} — the document store is per-gateway and "
+                             "bounded (LRU); ingest the document again via POST /v1/ingest")
+
+        question = str(payload.get("question") or "").strip()
+        if not question:
+            # OpenAI-style requests are accepted too: the last user turn is the question.
+            for message in reversed(payload.get("messages") or []):
+                if (
+                    isinstance(message, dict)
+                    and message.get("role") == "user"
+                    and isinstance(message.get("content"), str)
+                    and message.get("content").strip()
+                ):
+                    question = message["content"].strip()
+                    break
+        if not question:
+            return _err(400, "missing 'question' — pass a plain string, or messages[] with a user turn")
+        model = str(payload.get("model") or "").strip()
+        if not model:
+            return _err(400, "missing 'model' — doc Q&A forwards to the upstream like any chat request")
+        try:
+            top_k = int(payload.get("top_k") or DEFAULT_TOP_K)
+        except (TypeError, ValueError):
+            top_k = DEFAULT_TOP_K
+        top_k = max(1, min(10, top_k))
+
+        messages, idxs, chunks = assemble_messages(doc, question, top_k=top_k)
+        assembled: Dict[str, Any] = {"model": model, "messages": messages}
+        for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "user"):
+            if key in payload:
+                assembled[key] = payload[key]
+        if payload.get("stream"):
+            assembled["stream"] = True
+
+        doc_savings: Dict[str, Any] = {
+            "doc_id": doc.doc_id,
+            # Naive baseline: what re-sending the whole document + question costs.
+            "full_tokens": full_resend_tokens(doc, question),
+            "chunks_used": len(chunks),
+            "retrieved": [i + 1 for i in idxs],  # 1-based, as numbered in the prompt
+            "question_tokens": estimate_tokens(question),
+        }
+        return assembled, doc_savings
+
+    @staticmethod
+    def _doc_meta(result: PipelineResult) -> Dict[str, Any]:
+        """The ``optimizer`` block attached to doc-ask response bodies."""
+        ds = result.doc_savings or {}
+        sent = 0 if result.decision.route in ("cache", "local") else result.record.canonical_tokens
+        full = int(ds.get("full_tokens", 0))
+        avoided = max(0, full - sent)
+        return {
+            "mode": "doc",
+            "doc_id": ds.get("doc_id", ""),
+            "route": result.decision.route,
+            "chunks_used": ds.get("chunks_used", 0),
+            "retrieved_chunks": ds.get("retrieved", []),
+            "full_doc_tokens": full,      # naive resend baseline (doc + question)
+            "sent_tokens": sent,          # what Tokan actually forwarded
+            "tokens_avoided": avoided,
+            "avoided_pct": round(100.0 * avoided / full, 2) if full else 0.0,
+        }
 
     # -------------------------------------------------------------- local out
     def _stream_local(self, response: Dict[str, Any]) -> None:
@@ -724,6 +896,9 @@ class _Handler(BaseHTTPRequestHandler):
         cached = upstream_cached_tokens(parsed, protocol=protocol)
         if cached:
             extra["X-Optimizer-Upstream-Cached-Tokens"] = str(cached)
+        # Doc Governor: attach the retrieval economics to the answer body.
+        if result.doc_savings is not None:
+            parsed["optimizer"] = self._doc_meta(result)
         self._send_json(200, parsed, extra=extra)
         self._record_receipt(
             payload, result, route="llm", status=200,
@@ -767,8 +942,17 @@ class _Handler(BaseHTTPRequestHandler):
             # already on the wire.
             usage = _extract_streamed_usage(buffered, protocol)
             cached = usage_cached_tokens(usage, protocol=protocol)
-            if cached:
-                self.pipeline.metrics.record_upstream_cached(cached)
+            prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            if prompt_tokens or cached:
+                self.pipeline.metrics.record_provider_prompt(prompt_tokens, cached)
+            # Session Governor: prefix reuse applies to streamed turns too.
+            if result.prefix_reuse is not None:
+                self.pipeline.metrics.record_prefix_reuse(result.prefix_reuse.reused_tokens)
+            # Doc Governor: streamed doc asks book the assembled-prompt spend.
+            if result.doc_savings is not None:
+                self.pipeline.record_doc(
+                    result, sent_tokens=prompt_tokens or result.record.canonical_tokens
+                )
             # Cache the *answer text*, never the SSE framing.
             answer = _extract_streamed_text(buffered, protocol)
             if answer:

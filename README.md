@@ -9,7 +9,7 @@
 [![PyPI](https://img.shields.io/pypi/v/tokan)](https://pypi.org/project/tokan/)
 [![Python](https://img.shields.io/pypi/pyversions/tokan)](https://pypi.org/project/tokan/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-127%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-181%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
 
 ---
@@ -23,6 +23,7 @@ Tokan intercepts AI coding agent traffic, compacts it through a three-stage opti
 Coding agents burn millions of tokens re-reading files, re-parsing directory trees, replaying bloated histories, and resending identical context. Tokan eliminates that waste:
 
 - **24–59% token compaction** on noise-heavy agent turns (tool output, ANSI, log spam) and **100% savings** on repeated or deterministic turns — 27.5–28.3% measured across real mixed sessions (see [Benchmarks](#benchmark-results))
+- **Document Q&A without the resend** — ingest a long document once, then ask questions that travel as *summary + retrieved excerpts* instead of the whole file: **−87.8% prompt tokens offline, −85.9% on real Copilot with answer parity** ([Doc Governor](#doc-governor--ingest-once-answer-many))
 - **Instant cache hits** — identical context answered in 1–3ms with zero upstream tokens
 - **Transparent integration** — point your agent at one URL, keep everything else unchanged
 - **Multi-agent ready** — one gateway instance serves multiple concurrent agents
@@ -233,7 +234,7 @@ client = OptimizedAgentClient(transport=my_transport_callable)
 
 ### 3. MCP Server (stdio)
 
-Register one MCP server per agent to gain 5 optimization tools:
+Register one MCP server per agent to gain 7 optimization tools:
 
 ```bash
 token-optimizer mcp  # runs on stdin/stdout
@@ -245,6 +246,8 @@ token-optimizer mcp  # runs on stdin/stdout
 - `cache_lookup(text, semantic)` — semantic cache probe (whitespace-insensitive)
 - `cache_store(text, value)` — seed the cache with known answers
 - `session_metrics()` — live token/cost savings
+- `doc_ingest(text, doc_id?)` — index a long document once; returns a `doc_id` + extractive summary
+- `doc_search(doc_id, query, top_k?)` — summary + top-k excerpts for a question (far smaller than re-reading the file)
 
 **Agent registration** (varies per agent — see `token-optimizer setup <agent>`):
 - **Claude Code / Cursor**: `.mcp.json` → `{"mcpServers": {"tokan": {"command": "tokan-mcp"}}}`
@@ -364,7 +367,7 @@ copilot mcp add token-optimizer -- token-optimizer mcp
 # or edit ~/.copilot/mcp-config.json — `token-optimizer setup github-copilot` prints it
 ```
 
-The agent then gains `optimize_context`, `repo_index`, `cache_lookup`, `cache_store`, and `session_metrics` tools.
+The agent then gains `optimize_context`, `repo_index`, `cache_lookup`, `cache_store`, `session_metrics`, `doc_ingest`, and `doc_search` tools.
 
 ### Custom upstream headers
 
@@ -576,7 +579,7 @@ Tokan reports honestly rather than inflating:
 **Test methodology**:
 ```bash
 # Run local benchmark suite
-python3 -m unittest discover -s tests  # 107 tests, all pass
+python3 -m unittest discover -s tests  # 181 tests, all pass
 python3 examples/wrap_agent.py         # Offline SDK demo
 python3 tests/fake_upstream.py 8901 &  # Dual-wire upstream
 # Point agents at localhost:4040, check /metrics
@@ -770,6 +773,111 @@ token-optimizer serve --copilot --api-key "$(gh auth token)" --prompt-cache-key
 Off by default (provider support varies). An agent can also name its
 conversation explicitly with an `X-Optimizer-Session: <id>` header; otherwise the
 session key is derived from the message root (first system + first user message).
+
+---
+
+## Doc Governor — ingest once, answer many
+
+Document Q&A in its naive form **resends the entire document on every
+question** — a 9,000-token contract costs 9,000 tokens per question, forever.
+Tokan's **Doc Governor** inverts the flow:
+
+```
+naive:    [9,000-tok contract] + question   → 9,000 tok   (× every question)
+Doc Gov:  POST /v1/ingest  (once)  → doc_id, chunks, extractive summary
+          POST /v1/doc/ask (many)  → [summary + top-k excerpts + question]
+```
+
+Only the parts of the document that matter for *this* question travel to the
+model — an order of magnitude fewer tokens — while a deterministic **extractive
+summary** (IDF-salience sentences, document order) keeps the global context in
+the prompt. Retrieval is stdlib **TF-IDF cosine** over sentence-aware,
+overlap-carrying chunks: no embeddings, no services, no dependencies.
+
+```bash
+# 1. Ingest once
+curl -s http://127.0.0.1:4040/v1/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "<the whole document>"}'
+# → {"doc_id": "d_9d10a9…", "chunks": 33, "total_tokens": 7858,
+#    "summary_tokens": 158, "summary": "…"}
+
+# 2. Ask any number of questions (standard OpenAI wire underneath)
+curl -s http://127.0.0.1:4040/v1/doc/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"doc_id": "d_9d10a9…", "question": "What is the cap on liability?",
+       "model": "gpt-4o-mini"}'
+# → normal chat.completion + an "optimizer" block:
+#   {"optimizer": {"mode": "doc", "full_doc_tokens": 7866,
+#                  "sent_tokens": 1086, "tokens_avoided": 6780,
+#                  "avoided_pct": 86.2, "retrieved_chunks": [18, 17, 12]}}
+```
+
+Everything downstream is the normal pipeline: the assembled prompt is cached
+(repeating a question = **0 upstream tokens**), receipted, fallback-protected,
+and tracked per document (`session = doc:<doc_id>` for prefix-reuse stats).
+Doc-ask responses also carry `X-Optimizer-Doc-Id` / `X-Optimizer-Doc-Avoided-Tokens`
+headers; `stream: true` works too (economics disclosed via headers).
+
+### Measured: −87.8% offline, −85.9% live with answer parity
+
+`benchmarks/doc_qa.py` builds a synthetic 70-clause contract with **8 known
+gold facts**, ingests it, and measures both cost and quality — the gold fact's
+chunk must actually be in the retrieved set, because a fact that never reaches
+the prompt cannot be answered:
+
+```
+question          full-doc  doc-mode     saved   save%  hit@1  hit@k answerable
+governing law        7,869     1,094     6,775   86.1%    yes    yes        yes
+termination          7,869     1,087     6,782   86.2%    yes    yes        yes
+payment              7,868       882     6,986   88.8%    yes    yes        yes
+liability            7,866     1,086     6,780   86.2%    yes    yes        yes
+confidentiality      7,870       523     7,347   93.4%    yes    yes        yes
+arbitration          7,868       788     7,080   90.0%    yes    yes        yes
+insurance            7,870     1,090     6,780   86.1%    yes    yes        yes
+audit                7,869     1,100     6,769   86.0%    yes    yes        yes
+──────────────────────────────────────────────────────────────────────────────
+TOTAL/AVG           62,949     7,650    55,299   87.8%   8/8   8/8      8/8
+```
+
+**Context = 12.2% of the full document on average; recall@1 = 8/8.**
+
+Then the same questions against the **real Copilot upstream** (each question run
+twice — naive full-doc resend vs `/v1/doc/ask` — answers graded for the gold
+value in *both* columns):
+
+| question | full-doc prompt | doc-mode prompt | full-doc gold | doc gold |
+|---|---:|---:|---|---|
+| governing law | 5,299 | 799 | ✅ | ✅ |
+| termination | 5,300 | 797 | ✅ | ✅ |
+| payment | 5,300 | 652 | ✅ | ✅ |
+| **total** | **15,899** | **2,248** | **3/3** | **3/3** |
+
+**−85.9% prompt tokens with full answer parity (3/3 vs 3/3).** Read it
+honestly: fewer tokens only wins if answers stay correct — that's why both
+gold columns are graded, and why the benchmark's quality metric is *recall of
+the answer-bearing chunk*, not vibes. Retrieval is lexical (TF-IDF): a
+paraphrase sharing no vocabulary with the document is a real limitation, and
+the benchmark says so rather than hiding it.
+
+```bash
+python3 benchmarks/doc_qa.py                          # offline, deterministic
+PYTHONPATH=. python3 benchmarks/doc_qa.py --live --live-questions 3  # real Copilot
+```
+
+### Honesty contract (Doc metrics)
+
+- **`doc tokens avoided` is Tokan's own doing** (retrieval replaced a full
+  resend), so it's reported as its own number — `doc_avoided_pct`, dashboard
+  **Docs / Doc Q&A / Doc avoided** tiles, per-row `doc` marker — and **never
+  mixed into `tokens_saved`**, which stays compaction-only. Two different
+  baselines, one honest number each.
+- The **full-doc baseline** (`full_tokens`) is what re-sending the document +
+  question would have cost; receipts for doc asks use it as `original_tokens`,
+  so the existing Tokens/Saved columns tell the truth for doc rows.
+- The doc store is a **bounded in-memory LRU** (64 docs default) per gateway
+  process — restarting the gateway means re-ingesting; unknown `doc_id`s say
+  exactly that instead of guessing.
 
 ---
 
@@ -1225,14 +1333,14 @@ pip install -e ".[dev]"
 ### Run Tests
 
 ```bash
-python3 -m unittest discover -s tests           # 107 tests
+python3 -m unittest discover -s tests           # 181 tests
 python3 -m unittest tests.test_adapters         # Single module
 python3 -m pytest tests/ -v                     # With pytest
 ```
 
 ### Test Coverage
 
-Current: **107/107 tests passing (100%)**
+Current: **181/181 tests passing (100%)**
 
 - `test_adapters.py`: 20 tests (registry, detection, snippet rendering)
 - `test_mcp.py`: 14 tests (JSON-RPC, tools, stdio loop)
@@ -1240,6 +1348,8 @@ Current: **107/107 tests passing (100%)**
 - `test_copilot_proxy.py`: 13 tests (auth/identity passthrough, `/models`, serve flags)
 - `test_pipeline_and_proxy.py`: 10 tests (end-to-end, streaming, SDK, burst)
 - `test_tier1_v030.py`: 20 tests (persistent cache, receipts + dashboard, diff compaction, prompt-cache surfacing, model fallback)
+- `test_session_governor.py`: 17 tests (prefix stability, prefix-reuse measurement, provider cache surfacing)
+- `test_doc_governor.py`: 37 tests (chunking, TF-IDF recall@k, extractive summary, LRU store, ingest/doc-ask wire, doc metrics, MCP doc tools)
 - `test_cache.py`: 9 tests (local LRU, remote tier, fail-open)
 - `test_anthropic_proxy.py`: 8 tests (Anthropic wire, `count_tokens`, cache)
 - `test_gemini_proxy.py`: 7 tests (generateContent, SSE stream, part preservation)

@@ -21,6 +21,7 @@ import sys
 from typing import Any, Dict, List, Optional, TextIO
 
 from .adapters import GatewayInfo
+from .cdm import estimate_tokens
 from .pipeline import OptimizationPipeline
 from .repo_index import DEFAULT_IGNORE, build_index
 
@@ -107,6 +108,44 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "session_metrics",
         "description": "Live token/cost savings for this optimizer process.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "doc_ingest",
+        "description": (
+            "Ingest a long document once (chunk + TF-IDF index + extractive "
+            "summary) and get back a doc_id. Reuse the doc_id with doc_search "
+            "instead of re-reading the whole file on every question — this is "
+            "the Doc Governor: ingest once, ask many."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Full document text."},
+                "doc_id": {
+                    "type": "string",
+                    "description": "Optional explicit id (defaults to a content hash).",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "doc_search",
+        "description": (
+            "Retrieve the summary + top-k relevant excerpts of an ingested "
+            "document for a question. Returns far fewer tokens than re-reading "
+            "the full document; answer from the excerpts (they include their "
+            "chunk numbers for citation)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "doc_id": {"type": "string"},
+                "query": {"type": "string", "description": "Question to retrieve for."},
+                "top_k": {"type": "integer", "description": "Excerpts to return (default 3, max 10)."},
+            },
+            "required": ["doc_id", "query"],
+        },
     },
 ]
 
@@ -224,6 +263,57 @@ class MCPServer:
         if name == "session_metrics":
             return json.dumps(
                 {"session": self.pipeline.metrics.as_dict(), "cache": self.pipeline.cache.stats()},
+                indent=2,
+            )
+
+        if name == "doc_ingest":
+            text = args.get("text", "")
+            doc_id = args.get("doc_id") or None
+            doc = self.pipeline.documents.ingest(text, doc_id=doc_id)
+            self.pipeline.metrics.record_ingest(doc.chunk_count, doc.total_tokens)
+            return json.dumps(
+                {
+                    "doc_id": doc.doc_id,
+                    "chunks": doc.chunk_count,
+                    "total_tokens": doc.total_tokens,
+                    "summary_tokens": doc.summary_tokens,
+                    "summary": doc.summary,
+                    "next": f'doc_search {{"doc_id": "{doc.doc_id}", "query": "..."}}',
+                },
+                indent=2,
+            )
+
+        if name == "doc_search":
+            doc_id = str(args.get("doc_id") or "")
+            query = str(args.get("query") or "")
+            if not doc_id or not query:
+                raise ValueError("doc_search requires 'doc_id' and 'query'")
+            doc = self.pipeline.documents.get(doc_id)
+            if doc is None:
+                raise ValueError(
+                    f"unknown doc_id {doc_id!r} — ingest it first with doc_ingest"
+                )
+            try:
+                top_k = int(args.get("top_k") or 3)
+            except (TypeError, ValueError):
+                top_k = 3
+            top_k = max(1, min(10, top_k))
+            chunks, idxs = doc.retrieve(query, top_k=top_k)
+            return json.dumps(
+                {
+                    "doc_id": doc.doc_id,
+                    "query": query,
+                    "full_document_tokens": doc.total_tokens,
+                    "summary": doc.summary,
+                    "summary_tokens": doc.summary_tokens,
+                    "excerpts": [
+                        {"chunk": i + 1, "text": c}
+                        for i, c in zip(idxs, chunks)
+                    ],
+                    "retrieved_tokens": estimate_tokens(doc.summary) + sum(
+                        estimate_tokens(c) for c in chunks
+                    ),
+                },
                 indent=2,
             )
 

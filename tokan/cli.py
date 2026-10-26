@@ -212,6 +212,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
           f"({ratio:.0%} of prompt, upstream's own)")
     print(f"prefix reuse  : {session.get('prefix_reused_tokens', 0)} tokens "
           f"(base the provider discounts; kept stable by Tokan)")
+    if session.get("doc_questions"):
+        print(f"doc Q&A       : {session.get('doc_questions', 0)} questions over "
+              f"{session.get('doc_ingests', 0)} doc(s), avoided "
+              f"{session.get('doc_tokens_avoided', 0)} tokens "
+              f"({session.get('doc_avoided_pct', 0)}% vs full-doc resend)")
     print(f"fallbacks     : {session.get('fallbacks', 0)}")
     return 0
 
