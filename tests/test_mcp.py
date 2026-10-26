@@ -40,11 +40,13 @@ class TestHandshake(unittest.TestCase):
     def test_tools_list_schema(self):
         tools = call(self.server, "tools/list")["result"]["tools"]
         names = {t["name"] for t in tools}
-        self.assertEqual(names, {"optimize_context", "repo_index", "cache_lookup", "cache_store", "session_metrics"})
+        self.assertEqual(names, {"optimize_context", "repo_index", "cache_lookup",
+                                 "cache_store", "session_metrics",
+                                 "doc_ingest", "doc_search"})
         for tool in tools:
             self.assertIn("inputSchema", tool)
             self.assertIn("description", tool)
-        self.assertEqual(len(TOOLS), 5)
+        self.assertEqual(len(TOOLS), 7)
 
 
 class TestTools(unittest.TestCase):
@@ -147,7 +149,7 @@ class TestStdioLoop(unittest.TestCase):
         self.assertEqual(responses[0]["id"], 1)
         self.assertEqual(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION)
         self.assertEqual(responses[1]["id"], 2)
-        self.assertEqual(len(responses[1]["result"]["tools"]), 5)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 7)
 
     def test_tool_exception_becomes_error_result(self):
         server = MCPServer()

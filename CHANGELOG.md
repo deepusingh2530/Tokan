@@ -31,6 +31,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `benchmarks/live_prefix.py` (real Copilot — measured prefix reuse climbing
     with real `cached_tokens` hits). 17 new tests in
     `tests/test_session_governor.py`.
+- **Doc Governor (Phase 2) — ingest once, answer many.** Document Q&A normally
+  resends the entire document with every question. Tokan now serves
+  `POST /v1/ingest` (chunk + TF-IDF index + extractive summary → `doc_id`) and
+  `POST /v1/doc/ask` (retrieve top-k excerpts, assemble
+  `[summary + excerpts + question]`, forward as a standard OpenAI-wire payload
+  through the **normal pipeline** — cache, receipts, fallback, sessions all
+  reused; a repeated question is a 0-token cache hit):
+  - `tokan/doc.py`: sentence/paragraph-aware chunking with overlap (hard
+    windows for oversized blobs), stdlib TF-IDF cosine retrieval (deterministic,
+    no dependencies), IDF-salience extractive summary, bounded thread-safe LRU
+    `DocumentStore` (content-addressed ids), prompt assembly + full-resend
+    baseline math.
+  - **Doc metrics honesty:** savings reported as `doc_tokens_avoided` against
+    the naive full-document-resend baseline in dedicated counters
+    (`doc_ingests`, `doc_questions`, `doc_full_tokens`, `doc_sent_tokens`,
+    `doc_chunks_used`, `doc_avoided_pct`) — never mixed into `tokens_saved`,
+    which stays compaction-only. Doc receipts use the full-doc baseline as
+    `original_tokens`, so the dashboard's Tokens/Saved columns tell the truth
+    for doc rows (plus a `doc` marker), with new **Docs / Doc Q&A / Doc
+    avoided** tiles, `X-Optimizer-Doc-Id` / `X-Optimizer-Doc-Avoided-Tokens`
+    headers, an `optimizer` block in response bodies, and `doc=… avoided=…`
+    receipt lines.
+  - **MCP:** `doc_ingest` + `doc_search` tools so coding agents can index a
+    file once and retrieve excerpts per turn instead of re-reading it.
+  - Benchmarks: `benchmarks/doc_qa.py` — offline (8-question gold-fact
+    contract: −87.8% prompt tokens, recall@1 8/8) and `--live` (real Copilot,
+    full-doc vs doc-ask side by side: −85.9% prompt tokens, answer parity 3/3
+    vs 3/3). 37 new tests in `tests/test_doc_governor.py`, including an
+    extractive-oracle upstream that can only answer if the gold fact actually
+    reached the prompt.
 
 ## [0.3.1] - 2026-10-26
 

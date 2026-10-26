@@ -344,10 +344,85 @@ token-optimizer serve --copilot --api-key "$(gh auth token)" \
 | `POST /v1/chat/completions` | OpenAI wire |
 | `POST /v1/messages` | Anthropic wire |
 | `POST /v1beta/models/<m>:generateContent` (and `:streamGenerateContent`) | Gemini wire |
+| `POST /v1/ingest` | **Doc Governor:** index a document once → `doc_id` |
+| `POST /v1/doc/ask` | **Doc Governor:** ask an ingested document a question |
 | `GET /healthz` (alias `/health`) | Liveness probe |
 | `GET /models` (alias `/v1/models`) | Model-list passthrough (for agent pickers) |
 | `GET /metrics` | Machine-readable session + cache metrics (JSON) |
 | `GET /dashboard` | Human-readable live HTML dashboard |
+
+### Document Q&A — `/v1/ingest` + `/v1/doc/ask`
+
+The **Doc Governor** removes the classic document-Q&A waste: re-sending the
+whole document with every question. Ingest once, ask many:
+
+```bash
+# 1) Ingest the document once (chunking + TF-IDF index + summary happen here)
+curl -s http://127.0.0.1:4040/v1/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "<full document text>", "metadata": {"source": "contract.pdf"}}'
+```
+
+```json
+{
+  "doc_id": "d_9d10a9d672e6d9e8",
+  "chunks": 33,
+  "total_tokens": 7858,
+  "summary_tokens": 158,
+  "summary": "…extractive summary of the most salient sentences…",
+  "metadata": {"source": "contract.pdf"},
+  "next": "POST /v1/doc/ask {\"doc_id\": \"...\", \"question\": \"...\", \"model\": \"...\"}"
+}
+```
+
+`doc_id` defaults to a content hash (re-ingesting identical text returns the
+same id); pass `doc_id` explicitly to override. `text` (or `document`) is
+required — empty/missing text is a 400 with an explicit message.
+
+```bash
+# 2) Ask questions — as many as you like
+curl -s http://127.0.0.1:4040/v1/doc/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"doc_id": "d_9d10a9d672e6d9e8",
+       "question": "What is the cap on liability?",
+       "model": "gpt-4o-mini", "top_k": 3}'
+```
+
+The gateway assembles `[extractive summary + top-k retrieved excerpts +
+question]` as a standard OpenAI-wire payload and runs it through the **normal
+pipeline** — cache, receipts, model fallback, prefix/session tracking all apply.
+A repeated question is a cache hit: **0 upstream tokens**. The response is an
+ordinary `chat.completion` plus a disclosed `optimizer` block:
+
+```json
+{
+  "choices": [{"message": {"role": "assistant", "content": "…"}}],
+  "usage": {"prompt_tokens": 1086, "completion_tokens": 40},
+  "optimizer": {
+    "mode": "doc",
+    "doc_id": "d_9d10a9d672e6d9e8",
+    "route": "llm",
+    "chunks_used": 3,
+    "retrieved_chunks": [18, 17, 12],
+    "full_doc_tokens": 7866,
+    "sent_tokens": 1086,
+    "tokens_avoided": 6780,
+    "avoided_pct": 86.2
+  }
+}
+```
+
+- `full_doc_tokens` is the naive baseline (whole document + question);
+  `sent_tokens` is what Tokan actually forwarded; the difference is **doc
+  tokens avoided** — reported separately from compaction savings.
+- Headers: `X-Optimizer-Doc-Id`, `X-Optimizer-Doc-Avoided-Tokens` (these carry
+  the economics for `stream: true` responses too).
+- `question` may also be supplied OpenAI-style as `messages[]` (the last user
+  turn is taken as the question). `top_k` clamps to 1–10. `temperature`,
+  `top_p`, `max_tokens`, `user`, and `stream` pass through.
+- Errors are explicit: unknown `doc_id` → **404** (the store is a bounded
+  in-memory LRU, per gateway process — re-ingest after a restart); missing
+  `question` / `model` / `doc_id` → **400** naming the field.
 
 ---
 
@@ -474,6 +549,8 @@ so agents can call its optimization tools directly.
 | `cache_lookup` | Semantic cache probe — "is this context already known?" |
 | `cache_store` | Store a context in the cache |
 | `session_metrics` | Live savings / ROI counters |
+| `doc_ingest` | Index a long document once → `doc_id` + summary |
+| `doc_search` | Summary + top-k excerpts for a question (vs re-reading the file) |
 
 **Start it manually** (for testing):
 
@@ -510,9 +587,12 @@ total.
 An auto-refreshing HTML page showing:
 
 - **Counters:** requests, cache hits, local solves, LLM calls, tokens saved,
-  saved %, provider cache, fallbacks, cache entries, hit rate.
+  saved %, provider cache, prefix reuse, **Docs / Doc Q&A / Doc avoided**,
+  fallbacks, cache entries, hit rate.
 - **A rolling table of recent requests:** time, route, model, tokens in→out,
-  saved %, status, **latency (tokan / upstream)**, provider cache, fallback.
+  saved % (rows from `/v1/doc/ask` carry a `doc` marker — their savings are
+  measured against the full-document resend), status, **latency (tokan /
+  upstream)**, provider cache, fallback.
 
 The **latency split** is the important one for trust. Each row shows total
 end-to-end latency and, in parentheses, how much was Tokan's own overhead vs.
@@ -552,6 +632,7 @@ cost saved    : $0.09
 cache hit rate: 0.09 (7 entries)
 provider cache: 7552 cached tokens (31% of prompt, upstream's own)
 prefix reuse  : 24891 tokens (base the provider discounts; kept stable by Tokan)
+doc Q&A       : 4 questions over 1 doc(s), avoided 28410 tokens (87% vs full-doc resend)
 fallbacks     : 1
 ```
 
@@ -573,17 +654,41 @@ conversation with an `X-Optimizer-Session: <id>` header (otherwise the key is
 derived from the message root), and `--prompt-cache-key` can inject a stable
 cache key. See the README's *Session Governor* section for the measurements.
 
+### Doc Governor — doc tokens avoided
+
+Document Q&A economics are tracked in their **own counters** (`/metrics`
+`session` block, `stats` line, dashboard **Docs / Doc Q&A / Doc avoided**
+tiles):
+
+| Field | Meaning |
+|---|---|
+| `doc_ingests` / `doc_ingested_tokens` | documents stored / tokens stored |
+| `doc_questions` | `/v1/doc/ask` requests served |
+| `doc_full_tokens` | naive baseline: full document + question, per question |
+| `doc_sent_tokens` | what Tokan actually forwarded (0 on cache hits) |
+| `doc_tokens_avoided` | `doc_full_tokens − doc_sent_tokens` |
+| `doc_avoided_pct` | avoided ÷ full, in percent |
+| `doc_chunks_used` | retrieved excerpts sent (retrieval quality signal) |
+
+These are deliberately **not** mixed into `tokens_saved`: compaction savings
+and retrieval avoidance have different baselines, and one number per baseline
+is what stays defensible. Provider prompt-cache discounts remain the
+provider's, surfaced only.
+
 ### Receipts — `--log-requests`
 
 Start the gateway with `--log-requests` to get one console line per request:
 
 ```
 03:55:34 /v1/chat/completions route=llm status=200 model=gpt-4o-mini 41->27 tok (34.15%) 1553.56ms [tokan +1.43ms, upstream 1552.12ms] prefix_reuse=1390 upstream_cache=1664 (87%)
+12:04:11 /v1/doc/ask route=llm status=200 model=gpt-4o-mini 7866->1086 tok (86.2%) 1421.07ms [tokan +1.9ms, upstream 1419.2ms] doc=d_9d10a9d672e6d9e8 avoided=6780tok
 ```
 
 Each receipt carries: route, status, model, tokens in→out, savings %, total
-latency, the **tokan/upstream latency split**, plus **prefix reuse** and the
-**provider cache ratio** (`upstream_cache=… (…%)`) and any fallback event.
+latency, the **tokan/upstream latency split**, plus **prefix reuse**, the
+**provider cache ratio** (`upstream_cache=… (…%)`), any fallback event, and —
+for doc asks — the `doc=<id> avoided=<n>tok` line where `original_tokens` is
+the full-document baseline.
 
 ---
 
@@ -655,6 +760,7 @@ committed measurement battery (`benchmarks/scenarios.py`, results in
 | Oversized-but-rescuable payload | **~11%** | Enough noise elided to slip back under the provider's prompt cap. |
 | Exact repeat of a previous request | **100%** | Served from cache — zero upstream tokens. |
 | Deterministically answerable question | **100%** (route `local`) | Answered on your machine, no LLM call. |
+| Repeated document questions via `/v1/doc/ask` | **~86–88%** | Only summary + retrieved excerpts travel, not the whole document (measured, with recall@k reported alongside). |
 
 **Where Tokan honestly saves ~0%:**
 

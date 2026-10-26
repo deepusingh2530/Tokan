@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
+from .doc import DocumentStore
 from .jev import JevDecision, JevRouter
 from .metrics import SessionMetrics
 from .session import PrefixReuse, SessionTracker
@@ -35,7 +36,7 @@ from .session import PrefixReuse, SessionTracker
 __all__ = [
     "OptimizationPipeline", "PipelineResult", "LocalExecutor",
     "upstream_cached_tokens", "usage_cached_tokens",
-    "PrefixReuse", "SessionTracker",
+    "PrefixReuse", "SessionTracker", "DocumentStore",
 ]
 
 
@@ -112,6 +113,10 @@ class PipelineResult:
     # Session Governor: how much of this payload repeated the previous turn's
     # prefix (the base the provider's prompt cache discounts).
     prefix_reuse: Optional[PrefixReuse] = None
+    # Doc Governor: set on /v1/doc/ask results. Carries the naive full-doc
+    # baseline (``full_tokens``) and retrieval info so receipts/dashboard can
+    # report "doc tokens avoided" against what a full resend would have cost.
+    doc_savings: Optional[Dict[str, Any]] = None
 
     @property
     def route(self) -> str:
@@ -135,6 +140,8 @@ class OptimizationPipeline:
     metrics: SessionMetrics = field(default_factory=SessionMetrics)
     # Session Governor: per-session canonical payload tracking for prefix reuse.
     session: SessionTracker = field(default_factory=SessionTracker)
+    # Doc Governor: ingest-once document store backing /v1/ingest + /v1/doc/ask.
+    documents: DocumentStore = field(default_factory=DocumentStore)
     # Scope keys that change the answer (and therefore the cache key).
     scope_keys: tuple = ("model", "temperature", "top_p", "user")
 
@@ -276,6 +283,9 @@ class OptimizationPipeline:
         else:
             response = self._openai_response(content, model=model)
         self.metrics.record(route=route, original_tokens=result.record.original_tokens, optimized_tokens=0)
+        # Doc Governor: cache/local answers never left the machine, so the whole
+        # full-doc resend was avoided.
+        self.record_doc(result, sent_tokens=0)
         return response
 
     def record_llm(
@@ -304,11 +314,31 @@ class OptimizationPipeline:
         self.metrics.record_provider_prompt(prompt_tokens, cached)
         if result.prefix_reuse is not None:
             self.metrics.record_prefix_reuse(result.prefix_reuse.reused_tokens)
+        # Doc Governor: prompt_tokens is what actually reached the provider for
+        # this assembled [summary + chunks + question] prompt.
+        self.record_doc(result, sent_tokens=prompt_tokens)
         content = self._extract_content(response, protocol=protocol)
         if content:
             # Cache the plain text answer; shaping happens at serve time, so
             # an answer cached via Anthropic can be served via OpenAI too.
             self.cache.set(result.cache_key, content)
+
+    def record_doc(self, result: PipelineResult, *, sent_tokens: int) -> None:
+        """Book Doc Governor economics for a /v1/doc/ask result.
+
+        ``full_tokens`` is the naive baseline (whole document + question);
+        ``sent_tokens`` is what Tokan actually forwarded (0 on cache/local
+        hits). The difference is *doc tokens avoided* — Tokan's own doing,
+        reported separately from compaction savings.
+        """
+        ds = result.doc_savings
+        if not ds:
+            return
+        self.metrics.record_doc(
+            full_tokens=int(ds.get("full_tokens", 0)),
+            sent_tokens=sent_tokens,
+            chunks_used=int(ds.get("chunks_used", 0)),
+        )
 
     # --------------------------------------------------------------- helpers
     @staticmethod

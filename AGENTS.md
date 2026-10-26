@@ -6,10 +6,21 @@ Generated map of `Default Project` — structural index only; read files on dema
 - `AGENTS.md`
 - `CONTRIBUTING.md` — MyAgentAdapter
 - `README.md` — symbol_lookup, SQLiteStore, my_transport, MyCustomAgent, CustomJevRouter
+- `setup_github.sh`
+
+## benchmarks/
+
+- `ab_copilot.py` — gh_token, post, billed, make_payloads, run_leg, main
+- `bench_gateway.py` — record, pct, timed, free_port, FakeUpstream, _BenchServer, refactor_payload, unique_payload, local_payload, noisy_blob, post_json, get_json
+- `doc_qa.py` — contract, tokens_of, baseline_messages, run_offline, _post, _graded, run_live, main
+- `live_prefix.py` — _post, _conv, main
+- `prefix_cache.py` — _tokenize, _make_cache_upstream, _noisy_tool_output, _conversation, _post, _run_mode, _sum, main
+- `scenarios.py` — metrics, post, msg_level, run
 
 ## examples/
 
 - `build_repo_index.py` — walk, rel, collect_symbols, build_index, main
+- `real_session_replay.py` — ensure_requests_clone, read_files, mcp_example, FakeLLM, _Server, free_port, session_example, router_example, main
 - `run_proxy.py` — main
 - `wrap_agent.py` — fake_transport, main
 
@@ -21,11 +32,14 @@ Generated map of `Default Project` — structural index only; read files on dema
 - `test_cache.py` — TestLocalCache, _EdgeHandler, TestRemoteTier
 - `test_cdm.py` — TestStripAnsi, TestFingerprint, TestToolElision, TestConsecutiveDedup, TestFileTree, TestCompactText, TestEstimate
 - `test_copilot_proxy.py` — refactor_payload, RecordingUpstream, RecordingFixture, TestHeaderPassthrough, TestUpstreamFlags
+- `test_doc_governor.py` — _contract, _question, _post, _post_status, _get, _oracle_upstream, _make_server, _run, TestChunking, TestRetrieval, TestSummary, TestDocumentStore
 - `test_gemini_proxy.py` — FakeGeminiUpstream, TestGeminiProxy
 - `test_jev.py` — TestJevRouter
 - `test_mcp.py` — call, TestHandshake, TestTools, TestStdioLoop
-- `test_pipeline_and_proxy.py` — FakeUpstream, UpstreamFixture, TestPipeline, TestSDKClient, TestProxyGateway
+- `test_pipeline_and_proxy.py` — _UpstreamServer, FakeUpstream, UpstreamFixture, TestPipeline, TestSDKClient, TestProxyGateway
 - `test_repo_index.py` — TestGitignoreAwareWalk
+- `test_session_governor.py` — _post, _get, _tokenize, _make_server, _run, _cache_upstream, _conv, TestPrefixStability, TestSessionTracker, TestGovernorMetrics, TestPipelineIntegration, TestGovernorEndToEnd
+- `test_tier1_v030.py` — _post, _get, _ChatUpstream, _make_server, _run, TestSqliteStore, TestReceiptsAndDashboard, _CacheUpstream, TestUpstreamPromptCache, _GatedUpstream, TestModelFallback, TestDiffCompaction
 
 ## tokan/
 
@@ -33,10 +47,12 @@ Generated map of `Default Project` — structural index only; read files on dema
 - `__main__.py`
 - `cli.py` — _gateway_info, cmd_list, cmd_setup, cmd_serve, _build_pipeline, cmd_mcp, cmd_index, cmd_stats, build_parser, main
 - `client.py` — ChatResponse, OptimizedAgentClient
+- `doc.py` — _terms, chunk_text, TfidfIndex, summarize, Document, full_resend_tokens, assemble_messages, DocumentStore
 - `mcp.py` — MCPServer, _version, serve_stdio, main
 - `metrics.py` — SessionMetrics
-- `pipeline.py` — LocalExecutor, _default_handlers, PipelineResult, OptimizationPipeline
+- `pipeline.py` — LocalExecutor, usage_cached_tokens, upstream_cached_tokens, _default_handlers, PipelineResult, OptimizationPipeline
 - `repo_index.py` — _gitignore_rules, _is_ignored, walk, collect_symbols, build_index
+- `session.py` — PrefixReuse, SessionTracker
 
 ## tokan/adapters/
 
@@ -49,6 +65,7 @@ Generated map of `Default Project` — structural index only; read files on dema
 
 - `__init__.py`
 - `edge_cache.py` — CDNConfig, EdgeCache
+- `sqlite_store.py` — SqliteStore
 
 ## tokan/cdm/
 
@@ -58,17 +75,17 @@ Generated map of `Default Project` — structural index only; read files on dema
 ## tokan/jev/
 
 - `__init__.py`
-- `router.py` — JevDecision, JevRouter
+- `router.py` — JevDecision, _sample, JevRouter
 
 ## tokan/proxy/
 
 - `__init__.py`
 - `__main__.py`
-- `interceptor.py` — resolve_upstream_flags, add_upstream_flags, ProxyConfig, _Handler, _extract_streamed_text, TokenOptimizerProxy, main
+- `interceptor.py` — resolve_upstream_flags, add_upstream_flags, ProxyConfig, _Handler, _is_model_rejection, _extract_streamed_usage, _extract_streamed_text, _GatewayServer, TokenOptimizerProxy, main
 
 ## Docs
 - `AGENTS.md`
 - `CONTRIBUTING.md`
 - `README.md`
 
-<!-- 38/42 tracked files, 2710 bytes -->
+<!-- 52/62 tracked files, 4298 bytes -->
