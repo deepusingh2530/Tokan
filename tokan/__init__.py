@@ -13,7 +13,7 @@ from .jev import JevDecision, JevRouter
 from .metrics import SessionMetrics
 from .pipeline import LocalExecutor, OptimizationPipeline, PipelineResult
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "CDNConfig",
