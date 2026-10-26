@@ -293,6 +293,7 @@ Key ideas:
 | `--cache-db PATH` | — | SQLite file for a **persistent** cache that survives restarts. |
 | `--fallback-model MODEL` | — | Retry once with this model when upstream rejects the requested one (`model_not_supported` / `model_not_found`). |
 | `--log-requests` | off | Print one **receipt line** per request to the console. |
+| `--prompt-cache-key` | off | Inject a stable `prompt_cache_key` (the session id) into OpenAI-wire payloads so the provider routes the conversation to one prompt cache. Provider support varies; off by default. |
 
 ### Provider recipes
 
@@ -549,21 +550,40 @@ requests      : 9
 tokens saved  : 36517 (81.51%)
 cost saved    : $0.09
 cache hit rate: 0.09 (7 entries)
-provider cache: 7552 cached tokens (upstream's own)
+provider cache: 7552 cached tokens (31% of prompt, upstream's own)
+prefix reuse  : 24891 tokens (base the provider discounts; kept stable by Tokan)
 fallbacks     : 1
 ```
+
+### Session Governor — prefix reuse & provider cache ratio
+
+Two numbers explain the *economics* of a multi-turn session (distinct from
+Tokan's compaction savings, and never double-counted):
+
+- **prefix reuse** — tokens that repeated the previous turn's prefix. This is
+  the base the provider's prompt cache discounts. Tokan keeps that prefix
+  byte-stable so the discount actually fires.
+- **provider cache ratio** (`cached ÷ prompt`) — the share of upstream prompt
+  tokens the provider served from its own cache, read from the response.
+
+On the dashboard these appear as **Cache ratio** and **Prefix reuse** tiles plus
+a per-row **Prefix** column; in `stats` and `/metrics` they are
+`provider_cache_ratio` and `prefix_reused_tokens`. An agent can name its
+conversation with an `X-Optimizer-Session: <id>` header (otherwise the key is
+derived from the message root), and `--prompt-cache-key` can inject a stable
+cache key. See the README's *Session Governor* section for the measurements.
 
 ### Receipts — `--log-requests`
 
 Start the gateway with `--log-requests` to get one console line per request:
 
 ```
-03:55:34 /v1/chat/completions route=llm status=200 model=gpt-4o-mini 41->27 tok (34.15%) 1553.56ms [tokan +1.43ms, upstream 1552.12ms]
+03:55:34 /v1/chat/completions route=llm status=200 model=gpt-4o-mini 41->27 tok (34.15%) 1553.56ms [tokan +1.43ms, upstream 1552.12ms] prefix_reuse=1390 upstream_cache=1664 (87%)
 ```
 
 Each receipt carries: route, status, model, tokens in→out, savings %, total
-latency, the **tokan/upstream latency split**, plus any provider-cache or
-fallback event.
+latency, the **tokan/upstream latency split**, plus **prefix reuse** and the
+**provider cache ratio** (`upstream_cache=… (…%)`) and any fallback event.
 
 ---
 
@@ -742,6 +762,7 @@ token-optimizer <command>
       --cache-db PATH           Persistent SQLite cache
       --fallback-model MODEL    Retry once on model_not_supported/not_found
       --log-requests            One receipt line per request
+      --prompt-cache-key        Inject a stable prompt_cache_key (OpenAI wire)
 
   mcp                           Run the MCP server on stdio
       --cdn ENDPOINT
@@ -790,6 +811,14 @@ diffs trimmed), which can change a long-context answer the same way trimming
 context normally would. Change lines in diffs are always preserved. Cache and
 local routes return previously-computed or locally-computed answers with no
 model call.
+
+**What is the "Session Governor" / prefix reuse? Is that Tokan's savings?**
+No — and the distinction matters. Providers discount a repeated prompt *prefix*,
+but only if it's byte-identical. Tokan keeps the prefix byte-stable so that
+discount fires, and *measures* it (`prefix reuse`, `provider cache ratio`). Those
+tokens are the **provider's** billing discount, surfaced for visibility; Tokan's
+own savings are the compaction numbers (`tokens saved`). The two are reported
+separately and never double-counted. See the README's *Session Governor* section.
 
 **How do I report a bug or contribute?**
 <https://github.com/deepusingh2530/Tokan> — issues and PRs welcome. The test

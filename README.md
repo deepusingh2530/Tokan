@@ -699,6 +699,80 @@ Reading these honestly — including the rows that *don't* save anything:
 
 ---
 
+## Session Governor — pay only for what's new
+
+Coding agents resend their **full conversation history on every turn**. Modern
+providers (OpenAI, Anthropic, Gemini) auto-cache a repeated prompt **prefix**
+and bill those cached tokens at a steep discount (often ~0.1×) — but **only if
+the prefix is byte-identical** to the previous request. A compactor that
+serializes non-deterministically silently shatters that cache and the discount
+disappears.
+
+Tokan's **Session Governor** makes compaction *prefix-safe* and *measurable*:
+
+- **Deterministic compaction** — the shared history serializes byte-identically
+  every turn, so the provider's prompt cache keeps firing (proven by test and
+  benchmark).
+- **Prefix-reuse measurement** — the gateway remembers each session's last
+  canonical payload and reports how many tokens of the new request repeat the
+  previous prefix (the base the provider discounts), plus the **provider cache
+  ratio** (cached ÷ prompt) read from the response.
+- **Surfaces, never claims** — the reused prefix and cache ratio are the
+  *provider's* billing discount, which Tokan *enables* by keeping the prefix
+  stable. They are shown separately from Tokan's own compaction savings and
+  never double-counted.
+
+You'll see it on the dashboard (new **Cache ratio** / **Prefix reuse** tiles and
+a per-row **Prefix** column), in `--log-requests` receipts
+(`prefix_reuse=… upstream_cache=… (87%)`), and in `stats` / `/metrics`.
+
+### Measured: it cuts the expensive tokens, keeps the cache
+
+`benchmarks/prefix_cache.py` simulates the provider's prefix cache (fake
+upstream: `cached_tokens` = longest common prefix) over an 8-turn coding session
+with a large noisy build log each turn:
+
+| metric | baseline (no gateway) | via Tokan | delta |
+|---|---:|---:|---:|
+| total prompt tokens | 212,076 | 154,188 | **−27.3%** |
+| full-price tokens (uncached) | 47,107 | 34,243 | **−27.3%** |
+| relative cost (1× full + 0.1× cache) | 63,604 | 46,238 | **−27.3%** |
+| cache ratio (cached ÷ prompt) | 77.8% | **77.8%** | unchanged |
+
+Read it honestly: the **cache ratio is identical** in both modes, proving Tokan's
+compaction stayed byte-stable and did **not** shatter the provider's cache — while
+the **full-price tokens** (the new turn's noisy log, billed at 1×) drop 5,885 →
+4,277 per turn. That is the expensive part, and it is exactly what compaction
+targets.
+
+Verified against the **real Copilot upstream** too (`benchmarks/live_prefix.py`):
+Tokan's measured prefix reuse climbs monotonically across a growing session
+(0 → 1,390 → 4,152 → 8,286 → 13,792 tokens), and Copilot returns real
+`cached_tokens` once the prompt clears its minimum (1,664 then 5,120 on turns
+3–4). A turn that reads `cached=0` is an honest provider-side miss (minimum
+threshold / eviction) — real prompt caching is best-effort, and Tokan reports
+what actually happened rather than what it hoped.
+
+```bash
+python3 benchmarks/prefix_cache.py --turns 8      # synthetic, deterministic
+PYTHONPATH=. python3 benchmarks/live_prefix.py    # real Copilot (needs gh auth)
+```
+
+### `--prompt-cache-key` (opt-in)
+
+Some providers accept a `prompt_cache_key` to route a conversation to one cache.
+Tokan can inject a stable one (the session id) into OpenAI-wire payloads:
+
+```bash
+token-optimizer serve --copilot --api-key "$(gh auth token)" --prompt-cache-key
+```
+
+Off by default (provider support varies). An agent can also name its
+conversation explicitly with an `X-Optimizer-Session: <id>` header; otherwise the
+session key is derived from the message root (first system + first user message).
+
+---
+
 ## Multi-Agent Deployment
 
 ### Scenario 1: Shared Team Gateway

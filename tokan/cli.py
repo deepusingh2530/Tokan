@@ -111,6 +111,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         fallback_headers=fallback_headers,
         fallback_model=getattr(args, "fallback_model", None),
         log_requests=getattr(args, "log_requests", False),
+        prompt_cache_key=getattr(args, "prompt_cache_key", False),
     )
     proxy = TokenOptimizerProxy(config, pipeline).start()
     gw = _gateway_info(args)
@@ -206,7 +207,11 @@ def cmd_stats(args: argparse.Namespace) -> int:
     print(f"tokens saved  : {session.get('tokens_saved', 0)} ({session.get('saved_pct', 0)}%)")
     print(f"cost saved    : ${session.get('cost_saved_usd', 0)}")
     print(f"cache hit rate: {cache.get('hit_rate', 0)} ({cache.get('entries', 0)} entries)")
-    print(f"provider cache: {session.get('upstream_cached_tokens', 0)} cached tokens (upstream's own)")
+    ratio = session.get("provider_cache_ratio", 0) or 0
+    print(f"provider cache: {session.get('upstream_cached_tokens', 0)} cached tokens "
+          f"({ratio:.0%} of prompt, upstream's own)")
+    print(f"prefix reuse  : {session.get('prefix_reused_tokens', 0)} tokens "
+          f"(base the provider discounts; kept stable by Tokan)")
     print(f"fallbacks     : {session.get('fallbacks', 0)}")
     return 0
 
@@ -253,6 +258,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="retry once with this model on model_not_supported/model_not_found")
         p.add_argument("--log-requests", action="store_true",
                        help="print one receipt line per request (route, tokens, latency)")
+        p.add_argument("--prompt-cache-key", action="store_true",
+                       help="inject a stable prompt_cache_key (session id) into OpenAI-wire "
+                            "payloads so the provider routes the conversation to one prompt "
+                            "cache (support varies by provider; off by default)")
 
     p_serve = sub.add_parser("serve", help="run the optimization gateway")
     add_gateway_flags(p_serve)

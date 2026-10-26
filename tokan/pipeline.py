@@ -30,8 +30,13 @@ from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
 from .jev import JevDecision, JevRouter
 from .metrics import SessionMetrics
+from .session import PrefixReuse, SessionTracker
 
-__all__ = ["OptimizationPipeline", "PipelineResult", "LocalExecutor", "upstream_cached_tokens", "usage_cached_tokens"]
+__all__ = [
+    "OptimizationPipeline", "PipelineResult", "LocalExecutor",
+    "upstream_cached_tokens", "usage_cached_tokens",
+    "PrefixReuse", "SessionTracker",
+]
 
 
 class LocalExecutor:
@@ -104,6 +109,9 @@ class PipelineResult:
     local_answer: Optional[str] = None
     cached_value: Any = None
     cached: bool = False
+    # Session Governor: how much of this payload repeated the previous turn's
+    # prefix (the base the provider's prompt cache discounts).
+    prefix_reuse: Optional[PrefixReuse] = None
 
     @property
     def route(self) -> str:
@@ -125,6 +133,8 @@ class OptimizationPipeline:
     router: JevRouter = field(default_factory=JevRouter)
     executor: Optional[LocalExecutor] = None
     metrics: SessionMetrics = field(default_factory=SessionMetrics)
+    # Session Governor: per-session canonical payload tracking for prefix reuse.
+    session: SessionTracker = field(default_factory=SessionTracker)
     # Scope keys that change the answer (and therefore the cache key).
     scope_keys: tuple = ("model", "temperature", "top_p", "user")
 
@@ -157,7 +167,13 @@ class OptimizationPipeline:
         )
 
     # ------------------------------------------------------------- stage 1-2
-    def prepare(self, payload: Mapping[str, Any], *, protocol: str = "openai") -> PipelineResult:
+    def prepare(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        protocol: str = "openai",
+        session_key: Optional[str] = None,
+    ) -> PipelineResult:
         """Run CDM + cache probe + JeV decision. Does NOT touch the LLM.
 
         ``protocol`` is ``"openai"``, ``"anthropic"``, or ``"gemini"``.
@@ -168,6 +184,11 @@ class OptimizationPipeline:
         * ``"gemini"``: Generative Language API payload with ``contents`` and
           optional ``generationConfig``. The ``contents`` array is converted to
           messages for cache digesting; only the text parts are considered.
+
+        ``session_key`` names the conversation for the Session Governor (an
+        explicit ``X-Optimizer-Session`` header, or ``None`` to derive it from
+        the message root). It drives prefix-reuse measurement only — it never
+        changes the cache digest.
         """
         messages = payload.get("messages") or []
         scope = {k: payload.get(k) for k in self.scope_keys}
@@ -189,6 +210,11 @@ class OptimizationPipeline:
             # Include model in scope so different models don't share cache entries.
             scope["model"] = payload.get("model", scope.get("model"))
         record = self.normalizer.fingerprint(messages, scope)
+        # Session Governor: deterministic per-message strings + how much of this
+        # payload repeats the previous turn's prefix (the base the provider's
+        # prompt cache discounts).
+        msg_strings = self.normalizer.canonical_message_strings(messages)
+        prefix_reuse = self.session.observe(messages, msg_strings, explicit_key=session_key)
 
         cached_value = self.cache.get(record.digest)
         if cached_value is not None:
@@ -201,6 +227,7 @@ class OptimizationPipeline:
                 messages=self.normalizer.normalize_messages(messages),
                 cached_value=cached_value,
                 cached=True,
+                prefix_reuse=prefix_reuse,
             )
 
         query = self._last_user(messages)
@@ -224,6 +251,7 @@ class OptimizationPipeline:
             cache_key=record.digest,
             messages=self.normalizer.normalize_messages(messages),
             local_answer=answer,
+            prefix_reuse=prefix_reuse,
         )
 
     # ------------------------------------------------------------- stage 3-4
@@ -269,10 +297,13 @@ class OptimizationPipeline:
             optimized_tokens=prompt_tokens + completion_tokens,
         )
         cached = upstream_cached_tokens(response, protocol=protocol)
-        if cached:
-            # The provider's own prompt cache — surfaced for visibility, but
-            # never counted as *Tokan's* savings.
-            self.metrics.record_upstream_cached(cached)
+        # Session Governor economics: book the upstream prompt billing split
+        # (full-price vs provider-cached) and the reused-prefix base. Both are
+        # the provider's discount, surfaced for visibility — never counted as
+        # *Tokan's* savings.
+        self.metrics.record_provider_prompt(prompt_tokens, cached)
+        if result.prefix_reuse is not None:
+            self.metrics.record_prefix_reuse(result.prefix_reuse.reused_tokens)
         content = self._extract_content(response, protocol=protocol)
         if content:
             # Cache the plain text answer; shaping happens at serve time, so

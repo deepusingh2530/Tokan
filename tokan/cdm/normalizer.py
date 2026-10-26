@@ -278,6 +278,21 @@ class CDMNormalizer:
             payload["scope"] = {k: v for k, v in sorted(scope.items()) if v is not None}
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
+    def canonical_message_strings(self, messages: Sequence[Mapping[str, Any]]) -> List[str]:
+        """Deterministic per-message serialization, one string per message.
+
+        The Session Governor keys prefix reuse off these strings: because they
+        are byte-stable, a growing conversation's shared prefix serializes
+        identically every turn, which is exactly the condition a provider's
+        prompt cache needs to hit. (A non-deterministic compactor would break
+        that and silently cost the discount.)
+        """
+        normalized = self.normalize_messages(messages)
+        return [
+            json.dumps(m, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+            for m in normalized
+        ]
+
     def fingerprint(
         self,
         messages: Sequence[Mapping[str, Any]],

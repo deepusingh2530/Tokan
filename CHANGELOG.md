@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Session Governor (Phase 1) — stable-prefix engineering for provider prompt
+  caches.** Coding agents resend their full history every turn; providers
+  discount a repeated *prefix* (often ~0.1×) but only if it is byte-identical.
+  Tokan now guarantees its compaction is deterministic (so the shared prefix
+  stays byte-stable and the provider's cache keeps firing) and *measures* the
+  reused prefix:
+  - `SessionTracker` (`tokan/session.py`) derives a per-conversation session key
+    (or reads an `X-Optimizer-Session` header) and computes the longest common
+    prefix — in tokens — with the previous turn. That reused prefix is the base
+    the provider discounts.
+  - Per-request **prefix reuse** and **provider cache ratio** on receipts, the
+    console (`--log-requests`), `/metrics`, `stats`, and new dashboard tiles
+    (`Cache ratio`, `Prefix reuse`) plus a per-row `Prefix` column.
+  - **Honesty contract:** the reused prefix and provider cache ratio are the
+    *provider's* billing discount, which Tokan *enables* by keeping the prefix
+    stable — surfaced, never counted as Tokan's compaction savings.
+  - **`--prompt-cache-key`** (opt-in): injects a stable `prompt_cache_key` into
+    OpenAI-wire payloads so the provider routes the conversation to one cache.
+  - Benchmarks: `benchmarks/prefix_cache.py` (fake prefix-caching upstream —
+    −27.3% full-price tokens/turn with the cache ratio unchanged) and
+    `benchmarks/live_prefix.py` (real Copilot — measured prefix reuse climbing
+    with real `cached_tokens` hits). 17 new tests in
+    `tests/test_session_governor.py`.
+
 ## [0.3.1] - 2026-10-26
 
 ### Added

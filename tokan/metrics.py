@@ -23,6 +23,9 @@ class SessionMetrics:
         self.optimized_tokens = 0
         self.upstream_cached_tokens = 0  # provider prompt-cache hits (surfaced, not ours)
         self.fallbacks = 0               # model_not_supported retries via --fallback-model
+        # Session Governor: prefix stability + provider prompt-cache economics.
+        self.prefix_reused_tokens = 0    # tokens that repeated the previous prefix
+        self.provider_prompt_tokens = 0  # total prompt tokens billed upstream (llm calls)
 
     def record(self, route: str, original_tokens: int, optimized_tokens: int = 0) -> None:
         self.requests += 1
@@ -38,10 +41,32 @@ class SessionMetrics:
     def record_upstream_cached(self, tokens: int) -> None:
         """Tokens the *provider's* prompt cache answered (billed at a discount).
 
-        Surfaced for visibility only — Tokan did not save these, the upstream
+        Surfaced for visibility only -- Tokan did not save these, the upstream
         did; counting them as Tokan savings would be dishonest.
         """
         self.upstream_cached_tokens += max(0, int(tokens))
+
+    def record_prefix_reuse(self, tokens: int) -> None:
+        """Tokens that repeated the previous turn's prefix (provider discounts).
+
+        This is the base the provider's prompt cache applies to. Tokan keeps the
+        prefix byte-stable so the discount actually fires, but the discount
+        itself is the provider's -- tracked here to show the economics, never
+        counted in ``tokens_saved``.
+        """
+        self.prefix_reused_tokens += max(0, int(tokens))
+
+    def record_provider_prompt(self, prompt_tokens: int, cached_tokens: int) -> None:
+        """Book one LLM call's upstream prompt billing (full + cached split)."""
+        self.provider_prompt_tokens += max(0, int(prompt_tokens))
+        self.record_upstream_cached(cached_tokens)
+
+    @property
+    def provider_cache_ratio(self) -> float:
+        """Fraction of upstream prompt tokens the provider served from cache."""
+        if not self.provider_prompt_tokens:
+            return 0.0
+        return round(self.upstream_cached_tokens / self.provider_prompt_tokens, 4)
 
     def record_fallback(self) -> None:
         self.fallbacks += 1
@@ -63,7 +88,12 @@ class SessionMetrics:
     def report(self) -> str:
         extra = ""
         if self.upstream_cached_tokens:
-            extra += f" | provider prompt-cache: {self.upstream_cached_tokens} tok"
+            extra += (
+                f" | provider prompt-cache: {self.upstream_cached_tokens} tok"
+                f" ({self.provider_cache_ratio:.0%} of prompt)"
+            )
+        if self.prefix_reused_tokens:
+            extra += f" | prefix reuse: {self.prefix_reused_tokens} tok"
         if self.fallbacks:
             extra += f" | model fallbacks: {self.fallbacks}"
         return (
@@ -88,6 +118,9 @@ class SessionMetrics:
             "price_per_million_tokens": self.price_per_million_tokens,
             "upstream_cached_tokens": self.upstream_cached_tokens,
             "fallbacks": self.fallbacks,
+            "prefix_reused_tokens": self.prefix_reused_tokens,
+            "provider_prompt_tokens": self.provider_prompt_tokens,
+            "provider_cache_ratio": self.provider_cache_ratio,
         }
 
     def reset(self) -> None:
@@ -99,3 +132,5 @@ class SessionMetrics:
         self.optimized_tokens = 0
         self.upstream_cached_tokens = 0
         self.fallbacks = 0
+        self.prefix_reused_tokens = 0
+        self.provider_prompt_tokens = 0
