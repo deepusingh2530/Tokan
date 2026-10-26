@@ -35,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
+from ..session import SESSION_HEADER
 
 __all__ = [
     "TokenOptimizerProxy",
@@ -149,6 +150,10 @@ class ProxyConfig:
     fallback_model: Optional[str] = None
     #: Print one receipt line per request to the gateway console.
     log_requests: bool = False
+    #: Inject a stable ``prompt_cache_key`` (derived from the session) into
+    #: OpenAI-wire payloads so the provider routes the conversation to one
+    #: prompt cache. Opt-in; provider support varies, so off by default.
+    prompt_cache_key: bool = False
     #: How many receipts the /dashboard keeps in its rolling window.
     receipt_window: int = 500
 
@@ -218,6 +223,10 @@ class _Handler(BaseHTTPRequestHandler):
         sent = 0 if route in ("cache", "local") else result.record.canonical_tokens
         saved_pct = round(100.0 * (original - sent) / original, 2) if original else 0.0
         overhead = max(0.0, ms - upstream_ms)
+        pr = result.prefix_reuse
+        prefix_reused = pr.reused_tokens if pr else 0
+        # Per-request provider cache ratio (approx: cached / forwarded tokens).
+        cache_ratio = round(upstream_cached / sent, 4) if sent else 0.0
         rec: Dict[str, Any] = {
             "ts": time.time(),
             "path": self.path,
@@ -232,6 +241,9 @@ class _Handler(BaseHTTPRequestHandler):
             "overhead_ms": round(overhead, 2),
             "digest": result.record.digest[:16],
             "upstream_cached": upstream_cached,
+            "provider_cache_ratio": cache_ratio,
+            "prefix_reused": prefix_reused,
+            "session": pr.session_key if pr else "",
             "fallback": fallback,
         }
         self.receipts.append(rec)
@@ -243,8 +255,10 @@ class _Handler(BaseHTTPRequestHandler):
             )
             if upstream_ms:
                 line += f" [tokan +{rec['overhead_ms']}ms, upstream {rec['upstream_ms']}ms]"
+            if prefix_reused:
+                line += f" prefix_reuse={prefix_reused}"
             if upstream_cached:
-                line += f" upstream_cache={upstream_cached}"
+                line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
                 line += f" fallback={fallback}"
             print(line, flush=True)
@@ -294,11 +308,13 @@ class _Handler(BaseHTTPRequestHandler):
             f"(&#43;{esc(r.get('overhead_ms', r['ms']))} tokan"
             f"{'' if not r.get('upstream_ms') else ', ' + esc(r['upstream_ms']) + ' upstream'})"
             f"</span></td>"
-            f"<td>{esc(r['upstream_cached'])}</td>"
+            f"<td>{esc(r['upstream_cached'])}"
+            f"{' <span class=lat>(' + esc(round(100 * r.get('provider_cache_ratio', 0))) + '%)</span>' if r.get('upstream_cached') else ''}</td>"
+            f"<td>{esc(r.get('prefix_reused', 0))}</td>"
             f"<td>{esc(r['fallback'])}</td>"
             "</tr>"
             for r in receipts
-        ) or "<tr><td colspan='9' class='empty'>no requests yet</td></tr>"
+        ) or "<tr><td colspan='10' class='empty'>no requests yet</td></tr>"
 
         doc = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Tokan Gateway</title>
@@ -325,13 +341,15 @@ class _Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">LLM calls</div><div class="v">{esc(m['llm_calls'])}</div></div>
  <div class="card"><div class="k">Tokens saved</div><div class="v">{esc(m['tokens_saved'])}</div></div>
  <div class="card"><div class="k">Saved %</div><div class="v">{esc(m['saved_pct'])}%</div></div>
- <div class="card"><div class="k">Provider cache</div><div class="v">{esc(m['upstream_cached_tokens'])}</div></div>
+ <div class="card"><div class="k">Provider cache</div><div class="v" title="Tokens the provider's own prompt cache answered (its discount, not Tokan's)">{esc(m['upstream_cached_tokens'])}</div></div>
+ <div class="card"><div class="k">Cache ratio</div><div class="v" title="Share of upstream prompt tokens served from the provider's prompt cache">{esc(round(100 * m.get('provider_cache_ratio', 0), 1))}%</div></div>
+ <div class="card"><div class="k">Prefix reuse</div><div class="v" title="Tokens repeating the previous turn's prefix — the base the provider discounts (kept stable by Tokan)">{esc(m.get('prefix_reused_tokens', 0))}</div></div>
  <div class="card"><div class="k">Fallbacks</div><div class="v">{esc(m['fallbacks'])}</div></div>
  <div class="card"><div class="k">Cache entries</div><div class="v">{esc(c['entries'])}</div></div>
  <div class="card"><div class="k">Hit rate</div><div class="v">{esc(c['hit_rate'])}</div></div>
 </div>
 <table>
-<tr><th>Time</th><th>Route</th><th>Model</th><th>Tokens</th><th>Saved</th><th>Status</th><th title="Total end-to-end. Parenthetical splits Tokan's own overhead from time blocked waiting on the provider to generate the answer.">Latency (tokan / upstream)</th><th>Prov.cache</th><th>Fallback</th></tr>
+<tr><th>Time</th><th>Route</th><th>Model</th><th>Tokens</th><th>Saved</th><th>Status</th><th title="Total end-to-end. Parenthetical splits Tokan's own overhead from time blocked waiting on the provider to generate the answer.">Latency (tokan / upstream)</th><th title="Tokens the provider's own prompt cache answered (parenthesis = share of that request's prompt tokens)">Prov.cache</th><th title="Tokens repeating the previous turn's prefix — the base the provider discounts">Prefix</th><th>Fallback</th></tr>
 {rows}
 </table>
 </body></html>"""
@@ -361,7 +379,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         started = time.perf_counter()
-        result = self.pipeline.prepare(payload, protocol=protocol)
+        # Session Governor: an explicit X-Optimizer-Session header names the
+        # conversation; otherwise the key is derived from the message root.
+        session_key = (self.headers.get(SESSION_HEADER) or "").strip() or None
+        result = self.pipeline.prepare(payload, protocol=protocol, session_key=session_key)
 
         # 1) Cache hit / deterministic local answer: zero upstream tokens.
         if result.can_serve_locally:
@@ -546,6 +567,16 @@ class _Handler(BaseHTTPRequestHandler):
         started: Optional[float] = None,
     ) -> None:
         forwarded = dict(payload)
+        # Session Governor: a stable prompt_cache_key (the session id) tells the
+        # provider to route this conversation to one prompt cache. OpenAI-wire
+        # only, opt-in via --prompt-cache-key (support varies by provider).
+        if (
+            self.config.prompt_cache_key
+            and protocol == "openai"
+            and result.prefix_reuse is not None
+            and not payload.get("prompt_cache_key")
+        ):
+            forwarded["prompt_cache_key"] = result.prefix_reuse.session_key
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         headers.update(self._client_headers())
 
