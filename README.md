@@ -16,6 +16,8 @@
 
 Tokan intercepts AI coding agent traffic, compacts it through a three-stage optimization pipeline (**CDM → Edge Cache → JeV**), answers what it can without a model, caches what it's already seen, and forwards only the essential residue upstream. **One gateway works with Claude Code, Cursor, Aider, Codex, OpenCode, Cline, Roo Code, Continue, Gemini CLI, GitHub Copilot, and any OpenAI/Anthropic/Gemini SDK** — zero agent code changes required.
 
+> 📘 **New here?** Read the **[Complete Usage Guide](docs/USAGE.md)** — a detailed, end-to-end manual covering install, every `serve` flag, wiring each agent, the dashboard/receipts, and honest expectations about what saves tokens.
+
 ## Why Tokan?
 
 Coding agents burn millions of tokens re-reading files, re-parsing directory trees, replaying bloated histories, and resending identical context. Tokan eliminates that waste:
