@@ -300,11 +300,23 @@ class OptimizationPipeline:
         prompt_tokens = int(
             usage.get("prompt_tokens") or usage.get("input_tokens") or result.record.canonical_tokens
         )
-        completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        # Honest basis for `tokens_saved`: the local chars/4 estimate of the
+        # raw payload and the provider's tokenizer disagree by a few percent
+        # even when nothing was compacted, and subtracting one from the other
+        # would book that drift as "saved" (it doubled the claim in a live
+        # A/B measured against Copilot's bills). Project the raw estimate
+        # onto the provider's own basis — the raw/sent ratio applied to what
+        # was actually billed — so a clean payload claims exactly 0 and only
+        # real compaction shows up. Completion tokens are the model's
+        # output, never context savings, so they stay out entirely.
+        sent_estimate = max(1, result.record.canonical_tokens)
+        original_tokens = int(
+            round(result.record.original_tokens * prompt_tokens / sent_estimate)
+        )
         self.metrics.record(
             route="llm",
-            original_tokens=result.record.original_tokens,
-            optimized_tokens=prompt_tokens + completion_tokens,
+            original_tokens=original_tokens,
+            optimized_tokens=prompt_tokens,
         )
         cached = upstream_cached_tokens(response, protocol=protocol)
         # Session Governor economics: book the upstream prompt billing split

@@ -15,6 +15,7 @@ Generated map of `Default Project` — structural index only; read files on dema
 - `doc_qa.py` — contract, tokens_of, baseline_messages, run_offline, _post, _graded, run_live, main
 - `live_prefix.py` — _post, _conv, main
 - `prefix_cache.py` — _tokenize, _make_cache_upstream, _noisy_tool_output, _conversation, _post, _run_mode, _sum, main
+- `repo_ab.py` — gh_token, post, get, prompt_of, completion_of, answer_text, git, build_payloads, build_docset, grade, squash, parse_receipts
 - `scenarios.py` — metrics, post, msg_level, run
 
 ## examples/
@@ -88,4 +89,4 @@ Generated map of `Default Project` — structural index only; read files on dema
 - `CONTRIBUTING.md`
 - `README.md`
 
-<!-- 52/62 tracked files, 4298 bytes -->
+<!-- 53/64 tracked files, 4440 bytes -->

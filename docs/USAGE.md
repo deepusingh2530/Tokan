@@ -675,6 +675,17 @@ and retrieval avoidance have different baselines, and one number per baseline
 is what stays defensible. Provider prompt-cache discounts remain the
 provider's, surfaced only.
 
+### What `tokens_saved` is measured on
+
+Session `tokens_saved` is booked on the **provider's token basis**: the raw
+payload's local chars/4 estimate is projected by what the provider actually
+billed for the sent payload, so tokenizer disagreement is never booked as
+savings — a clean payload claims exactly 0 — and completion tokens (model
+output) are excluded, since only context counts as saved. `benchmarks/repo_ab.py`
+cross-checks these claims against real Copilot bills (measured: claims within
+10.6% of billed — the gap is the unbillable cache counterfactual, which stays
+an estimate — and doc counters within 1.2%).
+
 ### Receipts — `--log-requests`
 
 Start the gateway with `--log-requests` to get one console line per request:

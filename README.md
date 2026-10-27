@@ -9,7 +9,7 @@
 [![PyPI](https://img.shields.io/pypi/v/tokan)](https://pypi.org/project/tokan/)
 [![Python](https://img.shields.io/pypi/pyversions/tokan)](https://pypi.org/project/tokan/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-181%20passed-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-183%20passed-brightgreen)](tests/)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-zero-blue)]()
 
 ---
@@ -23,7 +23,7 @@ Tokan intercepts AI coding agent traffic, compacts it through a three-stage opti
 Coding agents burn millions of tokens re-reading files, re-parsing directory trees, replaying bloated histories, and resending identical context. Tokan eliminates that waste:
 
 - **24–59% token compaction** on noise-heavy agent turns (tool output, ANSI, log spam) and **100% savings** on repeated or deterministic turns — 27.5–28.3% measured across real mixed sessions (see [Benchmarks](#benchmark-results))
-- **Document Q&A without the resend** — ingest a long document once, then ask questions that travel as *summary + retrieved excerpts* instead of the whole file: **−87.8% prompt tokens offline, −85.9% on real Copilot with answer parity** ([Doc Governor](#doc-governor--ingest-once-answer-many))
+- **Document Q&A without the resend** — ingest a long document once, then ask questions that travel as *summary + retrieved excerpts* instead of the whole file: **−87.8% prompt tokens offline, −85.8% on real Copilot with answer parity** ([Doc Governor](#doc-governor--ingest-once-answer-many))
 - **Instant cache hits** — identical context answered in 1–3ms with zero upstream tokens
 - **Transparent integration** — point your agent at one URL, keep everything else unchanged
 - **Multi-agent ready** — one gateway instance serves multiple concurrent agents
@@ -567,6 +567,7 @@ Tokan reports honestly rather than inflating:
 | Exact repeat of a previous turn | **100%** (edge cache, 1–3 ms) |
 | Deterministic lookup (line numbers, counts) | **100%** (local executor, no LLM call) |
 | Oversized payload over the provider's prompt limit | request **fixed** (compaction brings it under the limit) |
+| Repeated questions over a long document | **58–86%** (Doc Governor `/v1/doc/ask`, answers graded for parity) |
 | Whole mixed session, real Copilot A/B | **27.5–28.3%** |
 
 ### Cache behavior (verified)
@@ -579,7 +580,7 @@ Tokan reports honestly rather than inflating:
 **Test methodology**:
 ```bash
 # Run local benchmark suite
-python3 -m unittest discover -s tests  # 181 tests, all pass
+python3 -m unittest discover -s tests  # 183 tests, all pass
 python3 examples/wrap_agent.py         # Offline SDK demo
 python3 tests/fake_upstream.py 8901 &  # Dual-wire upstream
 # Point agents at localhost:4040, check /metrics
@@ -636,6 +637,69 @@ output compacts ~24–27%; deterministic lookups and exact repeats are served
 locally at **100% savings and 1–3 ms** versus ~1.7–3.7 s upstream. Cache
 keys cover the full payload digest, so a *changed* context is never served a
 stale answer — rows 1 and 4 are misses by design.
+
+### Real-repository A/B (`benchmarks/repo_ab.py`) — with the ~0% rows kept in
+
+`ab_copilot.py` proves the pipeline on synthetic payloads; this harness
+proves it on **your repo**. Every payload is built from real artifacts of a
+real codebase (25 MB, 1,203 files, 443 `.ts` + 85 `.tsx`): an open source
+file, a real `git diff --stat` + `git log` + file tree, a real unified diff,
+a resent-history session, an exact repeat, and Doc Q&A over the repo's own
+agent docs (`AGENTS.md`, `instructions.md`, …) with gold-fact grading. Each
+payload is sent twice with **VS Code's exact Copilot identity headers**
+(`copilot-integration-id: vscode-chat`, `editor-version: 1.106.0`,
+`copilot-chat/0.30.0`) — the same wire VS Code produces:
+
+```bash
+token-optimizer serve --copilot --api-key "$(gh auth token)" --port 4040 \
+  --log-requests > /tmp/tokan-bench.log 2>&1 &
+python3 benchmarks/repo_ab.py --repo /path/to/your/repo \
+  --gateway http://127.0.0.1:4040 --gateway-log /tmp/tokan-bench.log
+```
+
+Full raw capture (both legs, receipts, validation, graded answers):
+[`benchmarks/results/repo_ab_prsniffer_2026-10-27.txt`](benchmarks/results/repo_ab_prsniffer_2026-10-27.txt).
+
+**`gpt-4o-mini`** (2026-10-27), prompt tokens per leg — direct = without
+Tokan, billed by Copilot's own `usage` both legs:
+
+| scenario (real artifact) | direct | via Tokan | saved | route |
+|---|---:|---:|---:|---|
+| open-file review — real `wire.ts` (clean TS) | 5,306 | 5,306 | 0.0% | `llm` |
+| agent turn — real `git diff --stat` + `git log` + file tree | 7,971 | 7,971 | 0.0% | `llm` |
+| real unified diff (`prReview.ts` @ HEAD~3) | 3,047 | 3,032 | 0.5% | `llm` |
+| 3 follow-ups, full history resent each turn | 16,082 | 16,082 | 0.0% | `llm` |
+| exact repeat of the last turn | 5,388 | 0 | **100%** | `cache` |
+| Doc Q&A over the repo's own docs (×3, gold 3/3 vs 3/3) | 17,121 | 6,753 | **60.6%** | `doc` |
+| **total** | **54,915** | **39,144** | **28.7%** | |
+
+The same full-doc payload pushed through the gateway bills the same as
+direct (clean text has no waste) — the doc row's saving comes from using
+`/v1/doc/ask`, not from proxying.
+
+**Validation — gateway claims vs the provider's bills.** The harness parses
+the `--log-requests` receipts and `/metrics` and puts them next to upstream
+`usage` on every leg:
+
+| claim | gateway | provider bill | delta |
+|---|---:|---:|---|
+| `tokens_saved` (session) | 5,978 | 5,403 | +10.6% — the gap is the cache counterfactual, which has no bill and stays an estimate |
+| `doc_tokens_avoided` | 10,491 | 10,368 | **+1.2%** |
+
+Writing this benchmark **caught two real defects**, fixed before publishing:
+`tokens_saved` subtracted provider bills from the local chars/4 *estimate*,
+booking tokenizer drift as savings (a 2× over-claim — now booked on the
+provider's own basis, so a clean payload claims exactly 0), and the
+extractive summary shipped as one long line that CDM's long-line protection
+silently truncated (doc prompts looked cheaper because context was missing —
+the summary is now wrapped, and the doc rows above are re-measured with it
+intact).
+
+Reading it honestly: **the 0.0% rows are the point.** Clean source has no
+waste, and clean source is what a normal VS Code chat sends — that is
+exactly why a casual trial "doesn't show much saving." Real savings live in
+repetition: exact repeats (cache), repeated questions over long documents
+(Doc Governor), and noisy tool output (CDM).
 
 ### Live scenario tests (v0.3.0 dashboard + receipts)
 
@@ -848,12 +912,12 @@ value in *both* columns):
 
 | question | full-doc prompt | doc-mode prompt | full-doc gold | doc gold |
 |---|---:|---:|---|---|
-| governing law | 5,299 | 799 | ✅ | ✅ |
-| termination | 5,300 | 797 | ✅ | ✅ |
-| payment | 5,300 | 652 | ✅ | ✅ |
-| **total** | **15,899** | **2,248** | **3/3** | **3/3** |
+| governing law | 5,299 | 804 | ✅ | ✅ |
+| termination | 5,300 | 802 | ✅ | ✅ |
+| payment | 5,300 | 657 | ✅ | ✅ |
+| **total** | **15,899** | **2,263** | **3/3** | **3/3** |
 
-**−85.9% prompt tokens with full answer parity (3/3 vs 3/3).** Read it
+**−85.8% prompt tokens with full answer parity (3/3 vs 3/3).** Read it
 honestly: fewer tokens only wins if answers stay correct — that's why both
 gold columns are graded, and why the benchmark's quality metric is *recall of
 the answer-bearing chunk*, not vibes. Retrieval is lexical (TF-IDF): a
@@ -1333,14 +1397,14 @@ pip install -e ".[dev]"
 ### Run Tests
 
 ```bash
-python3 -m unittest discover -s tests           # 181 tests
+python3 -m unittest discover -s tests           # 183 tests
 python3 -m unittest tests.test_adapters         # Single module
 python3 -m pytest tests/ -v                     # With pytest
 ```
 
 ### Test Coverage
 
-Current: **181/181 tests passing (100%)**
+Current: **183/183 tests passing (100%)**
 
 - `test_adapters.py`: 20 tests (registry, detection, snippet rendering)
 - `test_mcp.py`: 14 tests (JSON-RPC, tools, stdio loop)
