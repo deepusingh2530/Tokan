@@ -57,10 +57,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     file once and retrieve excerpts per turn instead of re-reading it.
   - Benchmarks: `benchmarks/doc_qa.py` — offline (8-question gold-fact
     contract: −87.8% prompt tokens, recall@1 8/8) and `--live` (real Copilot,
-    full-doc vs doc-ask side by side: −85.9% prompt tokens, answer parity 3/3
+    full-doc vs doc-ask side by side: −85.8% prompt tokens, answer parity 3/3
     vs 3/3). 37 new tests in `tests/test_doc_governor.py`, including an
     extractive-oracle upstream that can only answer if the gold fact actually
     reached the prompt.
+- **Real-repository A/B benchmark (`benchmarks/repo_ab.py`)** — every payload
+  built from an actual codebase (open source file, real `git diff --stat` +
+  `git log` + file tree, a real unified diff, a resent-history session, an
+  exact repeat, and Doc Q&A over the repo's own agent docs with gold-fact
+  grading), sent twice with VS Code's Copilot identity headers — direct vs
+  through a fresh gateway — plus a **VALIDATION block that checks the
+  gateway's claims (receipts + `/metrics`) against the provider's bills**.
+  Measured on a real 25 MB TypeScript repo: clean rows 0.0% (kept in,
+  honestly), exact repeat 100%, Doc Q&A 60.6% with 3/3 answer parity,
+  session total 28.7% (54,915 → 39,144 prompt tokens). Running it caught two
+  of the defects fixed below.
+
+### Fixed
+- **Session savings booked on the provider's token basis.** `tokens_saved`
+  subtracted upstream-billed tokens from the local chars/4 estimate of the
+  raw payload, so tokenizer disagreement was booked as savings — the live
+  A/B caught a 2× over-claim (11,009 claimed vs 5,403 billed). LLM legs now
+  project the raw estimate onto what the provider actually billed (raw/sent
+  ratio), so a clean payload claims exactly 0, and completion tokens (model
+  output) no longer dilute the counter. Same basis applied to streamed
+  responses when usage frames arrive. Re-measured: claims within 10.6% of
+  provider bills (the gap is the cache counterfactual, which has no bill and
+  stays an estimate), doc counters within 1.2%. 1 new regression test.
+- **Doc summary no longer truncated on the wire.** The extractive summary
+  was built as one long line, which the CDM normalizer's long-line
+  protection (`max_line_chars=2000`) silently elided — for long documents
+  ~2/3 of the summary never reached the provider, making doc prompts look
+  cheaper than they should while quietly losing context. `summarize()` now
+  wraps at 120 chars (no token cost — space becomes newline), doc prompts
+  carry the whole summary, and the real-repo A/B re-measures Doc Q&A at
+  58–63% with 3/3 answer parity on both legs. 1 new end-to-end regression
+  test (183 tests total).
 
 ## [0.3.1] - 2026-10-26
 

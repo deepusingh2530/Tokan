@@ -1,0 +1,83 @@
+Tokan real-repository A/B — captured 2026-10-27 (post-fix run)
+repo : /Users/shreyasaurav/OneQubitsSoftware/prsniffer-critical-gate (25 MB, 1203 files, 443 .ts + 85 .tsx)
+model: gpt-4o-mini · gateway: FRESH on :4040 with --log-requests
+method: same payloads, VS Code Copilot identity headers, direct vs via Tokan;
+        billed tokens from upstream usage both legs; VALIDATION block compares
+        gateway claims (receipts + /metrics) against those bills.
+reproduce: python3 benchmarks/repo_ab.py --repo <repo> --gateway http://127.0.0.1:4040 --gateway-log <log>
+
+repo   : /Users/shreyasaurav/OneQubitsSoftware/prsniffer-critical-gate
+model  : gpt-4o-mini   DIRECT (no Tokan) vs VIA http://127.0.0.1:4040 (fresh cache)
+identity: VS Code Copilot headers (copilot-integration-id: vscode-chat)
+
+[1] open file review (clean TS)
+     prompt  direct   5,306  via   5,306   (0.0% less)   route=llm   latency 2497ms -> 2655ms
+[2] agent turn: diff stat + log + file tree
+     prompt  direct   7,971  via   7,971   (0.0% less)   route=llm   latency 2388ms -> 2341ms
+[3] real unified diff (prReview.ts)
+     prompt  direct   3,047  via   3,032   (0.5% less)   route=llm   latency 2145ms -> 2074ms
+[4] session turn 1 (history resent)
+     prompt  direct   5,334  via   5,334   (0.0% less)   route=llm   latency 2359ms -> 2600ms
+[5] session turn 2 (history resent)
+     prompt  direct   5,360  via   5,360   (0.0% less)   route=llm   latency 2400ms -> 2396ms
+[6] session turn 3 (history resent)
+     prompt  direct   5,388  via   5,388   (0.0% less)   route=llm   latency 2386ms -> 2350ms
+[7] exact repeat of last turn
+     prompt  direct   5,388  via       0   (100.0% less)   route=cache   latency 2352ms -> 13ms
+
+--- Doc Governor: 22,909 chars of repo docs ---
+     ingested d_979c9e568bf1cfc5: 27 chunks, 5,728 tok (summary 1,479 tok)
+  Q1 prompt: full-doc  5,708 | via gateway  5,707 | doc-ask 2,256  (60.5% less)   gold: full yes / doc yes
+      full: The canonical repo config file is `.prsniffer.yaml`, while the legacy read-only fallback is `.mergegod.yaml`.
+      doc : The canonical repo config file is `.prsniffer.yaml`, and the legacy read-only fallback is `.mergegod.yaml`.
+  Q2 prompt: full-doc  5,707 | via gateway  5,706 | doc-ask 2,377  (58.3% less)   gold: full yes / doc yes
+      full: The development API runs on port **5050**, and the required Node version is **Node 22** (Node 20 also works for development).
+      doc : The API runs on port 5050, and the required Node version is Node 22 (Node 20 works for development).
+  Q3 prompt: full-doc  5,706 | via gateway  5,705 | doc-ask 2,120  (62.8% less)   gold: full yes / doc yes
+      full: One existing service that must be extended instead of building a parallel one is `prReview`.
+      doc : One existing service that must be extended instead of building a parallel one is `prReview`.
+
+==============================================================================
+VALIDATION — what the gateway claims vs what the provider billed
+==============================================================================
+
+receipts parsed from log: 4
+path                     claimed orig->sent  saved%
+/v1/chat/completions             5740->5721   0.33%
+/v1/doc/ask                      5749->2320  59.65%
+/v1/doc/ask                      5746->2446  57.43%
+/v1/doc/ask                      5749->2189  61.92%
+
+metric                              claimed (gateway)  measured (provider)
+--------------------------------------------------------------------------
+payload A/B prompt tokens          5,978 (tokens_saved)   5,403 (direct-via)
+doc Q&A avoided tokens             10,491 (doc_avoided) 10,368 (full-doc-docask)
+cache hits / llm calls                           1/12                     
+prefix reuse / provider cache         17,134 / 43,648
+
+==============================================================================
+SUMMARY (prompt tokens only — completion is the model's output, not context)
+==============================================================================
+scenario                                    direct  via tokan    saved
+----------------------------------------------------------------------
+open file review (clean TS)                  5,306      5,306     0.0%  [llm]
+agent turn: diff stat + log + file tree      7,971      7,971     0.0%  [llm]
+real unified diff (prReview.ts)              3,047      3,032     0.5%  [llm]
+session turn 1 (history resent)              5,334      5,334     0.0%  [llm]
+session turn 2 (history resent)              5,360      5,360     0.0%  [llm]
+session turn 3 (history resent)              5,388      5,388     0.0%  [llm]
+exact repeat of last turn                    5,388          0   100.0%  [cache]
+doc Q&A 1: Which repo config file is canon     5,708      2,256    60.5%  [doc]
+doc Q&A 2: What port does the dev API run      5,707      2,377    58.3%  [doc]
+doc Q&A 3: Name one existing service that      5,706      2,120    62.8%  [doc]
+----------------------------------------------------------------------
+TOTAL                                       54,915     39,144 28.7%
+
+Read honestly:
+ • Clean-code rows are expected to save ~0% — there is no waste in
+   clean source; Tokan reports the truth rather than inventing a %.
+ • Session/history rows measure what the *provider's* prefix cache
+   discounts (surfaced as prefix reuse), which Tokan keeps firing.
+ • Exact repeats and Doc Q&A are Tokan's own wins (cache / retrieval).
+ • The VALIDATION block above compares the dashboard's claims to the
+   provider's bills — if they disagree, trust the provider row.

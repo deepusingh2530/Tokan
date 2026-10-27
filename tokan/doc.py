@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import textwrap
 import threading
 import time
 from collections import Counter, OrderedDict
@@ -61,6 +62,9 @@ _TOKEN_RE = re.compile(r"[a-z0-9]+")
 DEFAULT_CHUNK_CHARS = 1200
 DEFAULT_CHUNK_OVERLAP = 150
 DEFAULT_SUMMARY_SENTENCES = 6
+#: Summary lines are wrapped at this width. Must stay well below the CDM
+#: normalizer's ``max_line_chars`` (2000) so the summary is never elided.
+_SUMMARY_LINE_CHARS = 120
 DEFAULT_TOP_K = 3
 
 
@@ -222,7 +226,12 @@ def summarize(
     # rank first (stable sort keeps source order on ties), then restore order.
     ranked = sorted(sentences, key=salience, reverse=True)[: max(1, max_sentences)]
     ranked.sort(key=lambda item: item[0])
-    return " ".join(sentence for _, sentence in ranked)
+    # Wrap instead of joining into one giant line: the CDM normalizer elides
+    # any single line longer than ~2k chars (minified-bundle protection), and
+    # a joined summary *is* one long line — silently losing its tail on the
+    # wire. Wrapping costs nothing (space -> newline) and keeps the summary
+    # whole end-to-end.
+    return textwrap.fill(" ".join(sentence for _, sentence in ranked), width=_SUMMARY_LINE_CHARS)
 
 
 # -------------------------------------------------------------------- document

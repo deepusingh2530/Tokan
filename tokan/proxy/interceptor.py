@@ -931,18 +931,32 @@ class _Handler(BaseHTTPRequestHandler):
             pass  # client disconnected mid-stream
         finally:
             self.wfile.write(b"0\r\n\r\n")
-            # Book prompt tokens only; completion tokens unknowable cheaply.
-            self.pipeline.metrics.record(
-                route="llm",
-                original_tokens=result.record.original_tokens,
-                optimized_tokens=result.record.canonical_tokens,
-            )
             # Usage frames (when the upstream sends them) carry the provider's
             # prompt-cache count — surfaced in metrics even though headers are
             # already on the wire.
             usage = _extract_streamed_usage(buffered, protocol)
             cached = usage_cached_tokens(usage, protocol=protocol)
             prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            # Same booking basis as record_llm: when the provider counted the
+            # prompt, project the local raw estimate onto that basis so
+            # estimator drift is never booked as savings; otherwise both
+            # sides stay on the local estimate (consistent with each other).
+            # Completion is unknowable cheaply on a stream — and is output,
+            # never context saved.
+            if prompt_tokens and result.record.canonical_tokens:
+                original = int(round(
+                    result.record.original_tokens * prompt_tokens
+                    / max(1, result.record.canonical_tokens)
+                ))
+                optimized = prompt_tokens
+            else:
+                original = result.record.original_tokens
+                optimized = result.record.canonical_tokens
+            self.pipeline.metrics.record(
+                route="llm",
+                original_tokens=original,
+                optimized_tokens=optimized,
+            )
             if prompt_tokens or cached:
                 self.pipeline.metrics.record_provider_prompt(prompt_tokens, cached)
             # Session Governor: prefix reuse applies to streamed turns too.

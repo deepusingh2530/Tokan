@@ -263,6 +263,38 @@ class TestPipelineIntegration(unittest.TestCase):
         self.assertGreater(pipe.metrics.prefix_reused_tokens, 0)
         self.assertAlmostEqual(pipe.metrics.provider_cache_ratio, 0.6, places=4)
 
+    def test_record_llm_never_books_tokenizer_drift_as_savings(self):
+        # Regression: tokens_saved subtracted provider-billed tokens from the
+        # local chars/4 estimate, booking the tokenizers' disagreement as
+        # savings (a live A/B caught a 2x over-claim). Booking must be on the
+        # provider's basis: raw estimate projected by the raw/sent ratio.
+        pipe = OptimizationPipeline()
+        r = pipe.prepare({"model": "m", "messages": _conv(1)})
+        pipe.record_llm(r, {
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        })
+        m = pipe.metrics.as_dict()
+        expected_original = int(round(
+            r.record.original_tokens * 7 / max(1, r.record.canonical_tokens)
+        ))
+        self.assertEqual(m["original_tokens"], expected_original)
+        self.assertEqual(m["optimized_tokens"], 7)  # completion is output
+        self.assertEqual(m["tokens_saved"], max(0, expected_original - 7))
+        # Whatever the estimator did, the claim can't exceed the compaction
+        # actually performed (original vs sent on the same local basis).
+        self.assertLessEqual(
+            m["tokens_saved"],
+            max(1, r.record.original_tokens - r.record.canonical_tokens),
+        )
+
+        # Without provider usage both sides stay on the local basis.
+        pipe2 = OptimizationPipeline()
+        r2 = pipe2.prepare({"model": "m", "messages": _conv(1)})
+        pipe2.record_llm(r2, {"choices": [{"message": {"content": "ok"}}]})
+        self.assertEqual(pipe2.metrics.original_tokens, r2.record.original_tokens)
+        self.assertEqual(pipe2.metrics.optimized_tokens, r2.record.canonical_tokens)
+
 
 # --------------------------------------------------------------- end-to-end
 class TestGovernorEndToEnd(unittest.TestCase):

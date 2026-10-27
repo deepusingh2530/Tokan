@@ -276,7 +276,33 @@ class TestSummary(unittest.TestCase):
         for sentence in self.doc.summary.split(". "):
             sentence = sentence.rstrip(".").strip()
             if len(sentence) > 10:
-                self.assertIn(sentence, self.doc_text)
+                self.assertIn(" ".join(sentence.split()), self.doc_text)
+
+    def test_summary_wrapped_so_cdm_never_elides_it(self):
+        # Regression: the summary used to be one giant line, and the CDM
+        # normalizer's long-line protection (max_line_chars=2000) silently
+        # cut its tail on the wire — shrinking billed prompts while quietly
+        # losing context. Dense doc -> long sentences -> long summary.
+        rule = (
+            "Rule {i}: spendAuthority, prReview, changeStack, riskScoring and "
+            "riskQueue must be extended rather than rebuilt for tenant {i}, "
+            "enforcing quota checks, billing safeguards, webhook HMAC "
+            "verification, replay-window rejection, tenant-scoped reads, "
+            "header stripping on every path, entitlement checks "
+            "(allowModelCall) and boot guards before serving traffic."
+        )
+        text = "\n".join(rule.format(i=i) for i in range(80))
+        doc = Document("d_dense", text)
+        self.assertGreater(doc.summary_tokens, 400)
+        # (a) no summary line approaches the normalizer's elision limit.
+        self.assertLessEqual(max(len(l) for l in doc.summary.splitlines()), 400)
+        # (b) end-to-end: normalize the assembled prompt — the *whole*
+        # summary must still be in it.
+        from tokan.cdm import CDMNormalizer
+
+        msgs, _, _ = assemble_messages(doc, "what must be extended?")
+        user = CDMNormalizer().normalize_messages(msgs)[1]["content"]
+        self.assertIn(" ".join(doc.summary.split()), " ".join(user.split()))
 
     def test_deterministic(self):
         doc2 = Document("d_facts", _contract())
