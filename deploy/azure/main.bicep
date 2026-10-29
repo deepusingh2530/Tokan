@@ -1,8 +1,34 @@
+// Tokan enterprise gateway — Azure Container Apps deployment.
+//
+// Deploys: ACA environment + gateway container app, Azure Cache for Redis,
+// Key Vault (+ placeholder secrets). The gateway proxies OpenAI-compatible
+// clients (VS Code Copilot BYOK, SDKs, agents) and runs the optimization
+// pipeline (AST compaction, semantic cache, adaptive routing) before
+// forwarding upstream.
+//
+// Auth note: upstreamApiKey is a deployment parameter (marked @secure(), so
+// its value is redacted from deployment history) and is passed to the
+// container as `--api-key`, which makes the gateway REPLACE any client's
+// Authorization header before forwarding upstream. For stricter secret
+// handling, move it to Key Vault and switch the container to an env-var
+// secret reference.
+
 param location string = resourceGroup().location
 param appName string = 'tokan-gateway'
 param containerImage string
-param minReplicas int = 2
-param maxReplicas int = 10
+
+// Upstream OpenAI-compatible endpoint the gateway forwards to, and the
+// credential the gateway injects upstream (clients need none).
+param upstreamUrl string
+@secure()
+param upstreamApiKey string
+
+// Session metrics are per-process in-memory; >1 replica would serve
+// inconsistent dashboard views. Scale-out requires centralized metrics
+// (e.g. App Insights) first — keep 1/1 until then.
+param minReplicas int = 1
+param maxReplicas int = 1
+
 param redisName string = 'tokan-redis'
 param keyVaultName string = 'tokan-kv'
 param openaiKeyName string = 'openai-api-key'
@@ -59,7 +85,6 @@ resource containerAppEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: appName
   location: location
-  dependsOn: [containerAppEnv]
   properties: {
     environmentId: containerAppEnv.id
     configuration: {
@@ -75,6 +100,21 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'gateway'
           image: containerImage
+          command: ['python']
+          args: [
+            '-m'
+            'tokan.cli'
+            'serve'
+            '--host'
+            '0.0.0.0'
+            '--port'
+            '4040'
+            '--upstream'
+            upstreamUrl
+            '--api-key'
+            upstreamApiKey
+            '--log-requests'
+          ]
           env: [
             { name: 'REDIS_URL', value: 'redis://${redisCache.properties.hostName}:${redisCache.properties.sslPort}/0' }
             { name: 'KEYVAULT_URL', value: 'https://${keyVault.properties.vaultUri}' }

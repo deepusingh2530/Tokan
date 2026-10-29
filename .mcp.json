@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "tokan": {
+      "command": "python3",
+      "args": ["-m", "tokan.mcp"],
+      "env": {
+        "TOKAN_GATEWAY_URL": "https://xxxxxxxx.eastus.azurecontainerapps.io",
+        "TOKAN_MODEL": "gpt-5-codex",
+        "AZURE_API_KEY": "${env:AZURE_API_KEY}"
+      }
+    }
+  }
+}

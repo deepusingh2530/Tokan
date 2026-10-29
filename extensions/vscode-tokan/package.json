@@ -4,15 +4,26 @@
   "description": "Routes IDE traffic to the enterprise Tokan gateway with live ROI metrics",
   "version": "0.1.0",
   "publisher": "tokan-enterprise",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "tokan.exportTerminalEnv",
         "title": "Tokan: Export Terminal Environment",
+        "category": "Tokan"
+      },
+      {
+        "command": "tokan.showMetrics",
+        "title": "Tokan: Show Metrics",
         "category": "Tokan"
       }
     ],
@@ -34,7 +45,10 @@
     },
     "menus": {
       "commandPalette": [
-        { "command": "tokan.exportTerminalEnv", "group": "0@1" }
+        {
+          "command": "tokan.exportTerminalEnv",
+          "group": "0@1"
+        }
       ]
     }
   },
@@ -43,8 +57,8 @@
     "compile": "tsc -p ./"
   },
   "devDependencies": {
-    "@types/vscode": "^1.85.0",
-    "@types/node": "^20.0.0",
-    "typescript": "^5.4.0"
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.140.0",
+    "typescript": "^5.9.3"
   }
 }
