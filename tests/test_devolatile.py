@@ -106,6 +106,37 @@ class TestDigestStability(unittest.TestCase):
             self.pipeline.prepare(ask("11112222-3333-4444-5555-666677778888")).record.digest,
         )
 
+    def test_copilot_datetime_envelope_share_digest(self):
+        # Copilot prepends <current_datetime>…</current_datetime> (ms precision,
+        # local offset) to the *user* turn: rotates per thread, same length.
+        def ask(stamp):
+            return {
+                "model": "m",
+                "messages": [
+                    {"role": "system", "content": "Follow Microsoft content policies."},
+                    {"role": "user", "content": f"<current_datetime>{stamp}</current_datetime>\n\nexplain agents.md"},
+                ],
+            }
+
+        first = self.pipeline.prepare(ask("2026-10-29T13:43:28.125+05:30"))
+        second = self.pipeline.prepare(ask("2026-10-29T13:44:03.006+05:30"))
+        self.assertEqual(first.record.digest, second.record.digest)
+        self.assertEqual(second.volatile_scrubbed, 1)
+
+    def test_user_text_outside_envelope_still_discriminates(self):
+        def ask(question):
+            return {
+                "model": "m",
+                "messages": [
+                    {"role": "user", "content": f"<current_datetime>2026-10-29T13:43:28.125+05:30</current_datetime>\n\n{question}"},
+                ],
+            }
+
+        self.assertNotEqual(
+            self.pipeline.prepare(ask("explain agents.md")).record.digest,
+            self.pipeline.prepare(ask("explain CONTRIBUTING.md")).record.digest,
+        )
+
     def test_wire_payload_keeps_original_bytes(self):
         payload, _ = _payload("9f8e7d6c-1a2b-4c5d-8e9f-0a1b2c3d4e5f", "unused")
         self.pipeline.prepare(payload)

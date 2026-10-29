@@ -127,6 +127,14 @@ _VOLATILE_PATTERNS = (
     (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<hex>"),
 )
 
+# Copilot stamps wall-clock time into the *user* turn as a
+# ``<current_datetime>...</current_datetime>`` envelope (millisecond precision,
+# local offset — rotates on every new thread). The tag is unambiguous client
+# framing, never user-authored, so its contents are canonicalized in the
+# fingerprint for any role. Text outside the envelope is left exact, and the
+# wire keeps the original bytes.
+_DATETIME_ENVELOPE = re.compile(r"<current_datetime>.*?</current_datetime>", re.DOTALL)
+
 
 def devolatile(text: str) -> "tuple[str, int]":
     """Replace rotating identifiers with stable placeholders; returns (text, hits).
@@ -307,10 +315,14 @@ class OptimizationPipeline:
         scrubbed: List[Dict[str, Any]] = []
         volatile_hits = 0
         for m in messages:
-            if m.get("role") == "system" and isinstance(m.get("content"), str):
-                text, n = devolatile(m["content"])
+            content = m.get("content")
+            if m.get("role") == "system" and isinstance(content, str):
+                text, n = devolatile(content)
                 volatile_hits += n
                 scrubbed.append({**m, "content": text})
+            elif isinstance(content, str) and _DATETIME_ENVELOPE.search(content):
+                scrubbed.append({**m, "content": _DATETIME_ENVELOPE.sub("<current_datetime/>", content)})
+                volatile_hits += 1
             else:
                 scrubbed.append(dict(m))
         if volatile_hits:

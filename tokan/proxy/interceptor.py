@@ -310,6 +310,14 @@ class _Handler(BaseHTTPRequestHandler):
                     prev.append(f"{m.get('role', '?')}:{c[:40]}")
             line += f" convo=[{' | '.join(prev)}{' ...' if len(result.messages) > 12 else ''}]"
             print(line, flush=True)
+            # One line per message (own log line, so Azure's per-line cap can't
+            # hide the middle of the payload): role, length, sha and head.
+            # This is how client-injected per-thread noise gets identified.
+            for i, m in enumerate(result.messages[:16]):
+                c = m.get("content")
+                if not isinstance(c, str):
+                    c = json.dumps(c, ensure_ascii=False, default=str)
+                print(f"    m[{i}] {m.get('role', '?')} len={len(c)} sha={hashlib.sha1(c.encode('utf-8')).hexdigest()[:6]} head={c[:80]!r} tail={c[-60:]!r}", flush=True)
 
     # ---------------------------------------------------------------- routes
     def do_GET(self) -> None:  # noqa: N802
