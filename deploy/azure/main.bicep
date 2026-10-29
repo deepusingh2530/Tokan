@@ -113,6 +113,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             upstreamUrl
             '--api-key'
             upstreamApiKey
+            '--prompt-cache-key'
             '--log-requests'
           ]
           env: [
