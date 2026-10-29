@@ -15,10 +15,13 @@
 
 param location string = resourceGroup().location
 param appName string = 'tokan-gateway'
+// Container image to run the gateway from (your own ACR/EH repo; no default
+// so registry endpoints are never baked into the template).
 param containerImage string
 
 // Upstream OpenAI-compatible endpoint the gateway forwards to, and the
-// credential the gateway injects upstream (clients need none).
+// credential the gateway injects upstream (clients need none). Both are
+// deployment-specific: pass them at deploy time, never commit them.
 param upstreamUrl string
 @secure()
 param upstreamApiKey string
