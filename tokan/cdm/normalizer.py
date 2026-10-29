@@ -186,12 +186,19 @@ class CDMNormalizer:
             lines = head + [marker] + tail
         return "\n".join(self._elide_long_line(line) for line in lines)
 
-    def compact_text(self, text: str) -> str:
+    def compact_text(self, text: str, *, tool: bool = False) -> str:
         """Noise-strip one text blob (ANSI, trailing WS, blank runs, elision).
 
         Public so wire adapters can compact payloads that don't arrive as
-        message lists — e.g. the Gemini API's per-part ``contents`` wire.
+        message lists — e.g. the Gemini API's per-part ``contents`` wire, or
+        the Responses API's typed ``input`` items.
+
+        ``tool=True`` applies the tool-output treatment instead (head/tail
+        kept, middle elided behind an explicit marker) — for wires that carry
+        tool results as opaque blobs rather than ``role: tool`` messages.
         """
+        if tool:
+            return self._compact_tool_output(text)
         text = self._tidy(text)
         return "\n".join(self._elide_long_line(line) for line in text.splitlines())
 

@@ -14,6 +14,7 @@ longest-common-prefix with the previous request).
 """
 import json
 import re
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
@@ -37,6 +38,14 @@ def _post(url, payload, headers=None):
 def _get(url):
     with urlopen(url, timeout=5) as resp:
         return resp.status, dict(resp.headers), resp.read().decode("utf-8")
+
+
+def _wait_receipts(gw, n, timeout=5.0):
+    """Receipts are appended just after the response flush; give the handler
+    thread a beat to land them before asserting (client-finishes-first race)."""
+    deadline = time.time() + timeout
+    while len(gw.receipts) < n and time.time() < deadline:
+        time.sleep(0.01)
 
 
 def _tokenize(text):
@@ -308,6 +317,7 @@ class TestGovernorEndToEnd(unittest.TestCase):
             for turns in (1, 2, 3):
                 _post(f"{base}/chat/completions",
                       {"model": "m", "messages": _conv(turns)})
+            _wait_receipts(gw, 3)
             self.assertGreaterEqual(len(gw.receipts), 3)
             turn2, turn3 = gw.receipts[1], gw.receipts[2]
             # Later turns repeat the earlier prefix -> measured reuse + a real
@@ -333,6 +343,7 @@ class TestGovernorEndToEnd(unittest.TestCase):
             for turns in (1, 2, 3, 4):
                 _post(f"{base}/chat/completions",
                       {"model": "m", "messages": _conv(turns)})
+            _wait_receipts(gw, 4)
             reuse = [r["prefix_reused"] for r in gw.receipts]
             # Each turn carries the whole prior history, so reuse climbs.
             self.assertEqual(reuse, sorted(reuse))
@@ -372,6 +383,7 @@ class TestGovernorEndToEnd(unittest.TestCase):
                   {"model": "m", "messages": _conv(1)}, headers=hdr)
             _post(f"{base}/chat/completions",
                   {"model": "m", "messages": _conv(2)}, headers=hdr)
+            _wait_receipts(gw, 2)
             self.assertEqual(gw.receipts[0]["session"], "my-convo")
             self.assertEqual(gw.receipts[1]["session"], "my-convo")
             self.assertGreater(gw.receipts[1]["prefix_reused"], 0)

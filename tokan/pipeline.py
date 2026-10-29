@@ -24,7 +24,7 @@ Content is stored as plain text and shaped per protocol at serve time.
 import json
 import uuid as uuid_mod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
@@ -35,7 +35,7 @@ from .session import PrefixReuse, SessionTracker
 
 __all__ = [
     "OptimizationPipeline", "PipelineResult", "LocalExecutor",
-    "upstream_cached_tokens", "usage_cached_tokens",
+    "upstream_cached_tokens", "usage_cached_tokens", "responses_input_to_messages",
     "PrefixReuse", "SessionTracker", "DocumentStore",
 ]
 
@@ -67,8 +67,53 @@ def usage_cached_tokens(usage: Mapping[str, Any], *, protocol: str = "openai") -
         return int(usage.get("cachedContentTokenCount") or 0)
     if protocol == "anthropic":
         return int(usage.get("cache_read_input_tokens") or 0)
-    details = usage.get("prompt_tokens_details") or {}
+    # Chat wire: prompt_tokens_details; Responses wire: input_tokens_details.
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     return int(details.get("cached_tokens") or 0)
+
+
+def responses_input_to_messages(input_value: Any) -> List[Dict[str, Any]]:
+    """Map a Responses-API ``input`` to chat-shaped messages for the pipeline.
+
+    The Responses wire carries conversation history as typed items (``message``,
+    ``function_call``, ``function_call_output``, ``reasoning``, ...). The
+    pipeline's cache digest, session prefix tracking and local executor all
+    speak ``messages``, so items are *projected* here — never forwarded; the
+    wire itself is compacted in place at forward time. Tool outputs project as
+    ``tool`` role so CDM tool-elision and duplicate-dropping apply to them.
+    """
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}] if input_value else []
+    if not isinstance(input_value, list):
+        return []
+    messages: List[Dict[str, Any]] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "message" or (kind is None and item.get("role")):
+            content = item.get("content")
+            if isinstance(content, list):
+                text = "\n".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                )
+            else:
+                text = str(content or "")
+            messages.append({"role": str(item.get("role", "user")), "content": text})
+        elif kind == "function_call":
+            messages.append(
+                {"role": "assistant", "content": f"{item.get('name', '')}({item.get('arguments', '')})"}
+            )
+        elif kind == "function_call_output":
+            out = item.get("output")
+            if isinstance(out, list):
+                out = "\n".join(p.get("text", "") for p in out if isinstance(p, dict))
+            messages.append({"role": "tool", "content": str(out or "")})
+        # reasoning items are per-turn model scratchpad, not conversation:
+        # excluded on purpose so the digest tracks what the user controls.
+    return messages
 
 
 def upstream_cached_tokens(response: Mapping[str, Any], *, protocol: str = "openai") -> int:
@@ -198,6 +243,12 @@ class OptimizationPipeline:
         changes the cache digest.
         """
         messages = payload.get("messages") or []
+        if not messages and "input" in payload:
+            # Responses API wire: the conversation lives in `input` (a string
+            # or typed items), not `messages`. Project it so the digest,
+            # session prefix tracking and cache probes see the real request —
+            # without this every responses payload fingerprints identically.
+            messages = responses_input_to_messages(payload.get("input"))
         scope = {k: payload.get(k) for k in self.scope_keys}
         if protocol == "anthropic" and payload.get("system") is not None:
             scope = dict(scope)
@@ -268,6 +319,7 @@ class OptimizationPipeline:
         *,
         model: str = "local",
         protocol: str = "openai",
+        endpoint: str = "",
     ) -> Dict[str, Any]:
         """Build a protocol-shaped response for a cache/local hit and book it."""
         if result.cached:
@@ -280,6 +332,11 @@ class OptimizationPipeline:
             response = self._anthropic_response(content, model=model)
         elif protocol == "gemini":
             response = self._gemini_response(content, model=model)
+        elif endpoint == "responses":
+            # Same cached text, Responses wire: `output` items, not `choices`.
+            response = self._responses_response(
+                content, model=model, input_tokens=result.record.canonical_tokens
+            )
         else:
             response = self._openai_response(content, model=model)
         self.metrics.record(route=route, original_tokens=result.record.original_tokens, optimized_tokens=0)
@@ -392,6 +449,21 @@ class OptimizationPipeline:
             content = message.get("content")
             if isinstance(content, str):
                 return content
+        # Responses wire: output items with output_text parts, no `choices`.
+        output = response.get("output")
+        if isinstance(output, list):
+            texts = []
+            for item in output:
+                if isinstance(item, dict) and item.get("type") == "message":
+                    for p in item.get("content") or []:
+                        if (
+                            isinstance(p, dict)
+                            and p.get("type") in ("output_text", "text")
+                            and isinstance(p.get("text"), str)
+                        ):
+                            texts.append(p["text"])
+            if texts:
+                return "".join(texts)
         content = response.get("content")
         if isinstance(content, str):
             return content
@@ -450,4 +522,35 @@ class OptimizationPipeline:
                     "finishReason": "STOP",
                 }
             ]
+        }
+
+    @staticmethod
+    def _responses_response(content: str, *, model: str, input_tokens: int = 0) -> Dict[str, Any]:
+        """Responses API shape for a locally-served (cache/local) answer.
+
+        Same cached text as the chat wire would get, but shaped as a completed
+        response object so Responses-API clients (gpt-5/codex in Copilot BYOK)
+        can parse it without touching the provider.
+        """
+        output_tokens = estimate_tokens(content)
+        return {
+            "id": f"resp_optimizer_{uuid_mod.uuid4().hex[:20]}",
+            "object": "response",
+            "status": "completed",
+            "model": model,
+            "output": [
+                {
+                    "type": "message",
+                    "id": f"msg_optimizer_{uuid_mod.uuid4().hex[:20]}",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content, "annotations": []}],
+                }
+            ],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "optimizer": {"served_without_llm": True},
         }

@@ -433,11 +433,11 @@ class _Handler(BaseHTTPRequestHandler):
             result.doc_savings = doc_savings
 
         # 1) Cache hit / deterministic local answer: zero upstream tokens.
-        # Responses API payloads (`input`, not `messages`) always go upstream —
-        # a chat-shaped local answer would be the wrong wire format.
-        if result.can_serve_locally and endpoint != "responses":
+        # Every wire gets its own response shape — including Responses API.
+        if result.can_serve_locally:
             response = self.pipeline.serve_local(
-                result, model=str(payload.get("model", "optimizer-local")), protocol=protocol
+                result, model=str(payload.get("model", "optimizer-local")),
+                protocol=protocol, endpoint=endpoint,
             )
             if doc_savings is not None:
                 response["optimizer"] = self._doc_meta(result)
@@ -447,6 +447,8 @@ class _Handler(BaseHTTPRequestHandler):
                     self._stream_local_anthropic(response)
                 elif protocol == "gemini":
                     self._stream_local_gemini(response)
+                elif endpoint == "responses":
+                    self._stream_local_responses(response)
                 else:
                     self._stream_local(response)
             else:
@@ -677,6 +679,39 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream_local_responses(self, response: Dict[str, Any]) -> None:
+        """Full Responses-API event sequence for a locally-served answer.
+
+        Cache/local hits for streaming Responses clients (Copilot BYOK) emit
+        the same bookend events the provider would — created → output item →
+        text deltas → completed — so the client renders the cached answer
+        without the gateway ever contacting the model.
+        """
+        item = response["output"][0]
+        text = item["content"][0]["text"]
+        in_progress = {**response, "status": "in_progress"}
+        events = [
+            ("response.created", {"type": "response.created", "response": in_progress}),
+            ("response.in_progress", {"type": "response.in_progress", "response": in_progress}),
+            ("response.output_item.added", {"type": "response.output_item.added",
+                                            "output_index": 0, "item": {**item, "status": "in_progress"}}),
+            ("response.output_text.delta", {"type": "response.output_text.delta",
+                                            "item_id": item["id"], "output_index": 0,
+                                            "content_index": 0, "delta": text}),
+            ("response.output_text.done", {"type": "response.output_text.done",
+                                           "item_id": item["id"], "output_index": 0,
+                                           "content_index": 0, "text": text}),
+            ("response.output_item.done", {"type": "response.output_item.done",
+                                           "output_index": 0, "item": item}),
+            ("response.completed", {"type": "response.completed", "response": response}),
+        ]
+        body = "".join(f"event: {event}\ndata: {json.dumps(data)}\n\n" for event, data in events).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ------------------------------------------------------------- upstream
     def _client_headers(self) -> Dict[str, str]:
         """Headers the client sent that the upstream must also see.
@@ -734,6 +769,64 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _compact_responses_input(self, input_value: Any) -> Any:
+        """Noise-strip text parts on the Responses wire, preserving item shape.
+
+        Message items get their text parts compacted (ANSI, trailing whitespace,
+        blank runs, diff-context and long-line elision — the same treatment the
+        chat wire's messages get); exact-repeat ``function_call_output`` items
+        collapse to an explicit marker so agent loops stop paying for the same
+        tool dump every turn. Everything else — ``function_call``,
+        ``reasoning``, images, plain strings — passes through untouched.
+        """
+        compact = self.pipeline.normalizer.compact_text
+        if isinstance(input_value, str):
+            return compact(input_value)
+        if not isinstance(input_value, list):
+            return input_value
+        out: List[Any] = []
+        prev_output_key: Optional[str] = None
+        for item in input_value:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+            kind = item.get("type")
+            if kind == "message":
+                content = item.get("content")
+                if isinstance(content, str):
+                    item = {**item, "content": compact(content)}
+                elif isinstance(content, list):
+                    item = {**item, "content": [
+                        {**p, "text": compact(p["text"])}
+                        if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                        for p in content
+                    ]}
+                out.append(item)
+                prev_output_key = None  # not consecutive with a previous output
+            elif kind == "function_call_output":
+                output = item.get("output")
+                key = json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
+                if key == prev_output_key and len(key) > 200:
+                    # Consecutive exact repeat of a *substantial* output: keep
+                    # the item (call ids differ) but drop the payload behind
+                    # the same never-silently-delete marker CDM uses.
+                    out.append({**item, "output": "[cdm: duplicate of previous tool output elided]"})
+                else:
+                    if isinstance(output, str):
+                        item = {**item, "output": compact(output, tool=True)}
+                    elif isinstance(output, list):
+                        item = {**item, "output": [
+                            {**p, "text": compact(p["text"], tool=True)}
+                            if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                            for p in output
+                        ]}
+                    out.append(item)
+                    prev_output_key = key
+            else:
+                out.append(item)
+                prev_output_key = None  # only tool outputs may repeat consecutively
+        return out
 
     def _forward(
         self,
@@ -801,8 +894,14 @@ class _Handler(BaseHTTPRequestHandler):
             headers.setdefault("anthropic-version", self.headers.get("anthropic-version", "2023-06-01"))
         else:
             if endpoint == "responses":
-                # Responses API wire: keep `input` (and everything else)
-                # exactly as sent; only the URL changes.
+                # Responses API wire: compact text parts in place (same
+                # noise-stripping the chat wire gets) and collapse exact-repeat
+                # tool outputs; typed items (function_call, reasoning, images)
+                # pass through untouched — flattening them would corrupt the
+                # request. Compaction is deterministic, so the prefix stays
+                # byte-stable and the provider's prompt cache can hit.
+                forwarded["input"] = self._compact_responses_input(payload.get("input"))
+                forwarded.pop("messages", None)
                 url = self.config.upstream_base.rstrip("/") + "/responses"
             else:
                 forwarded["messages"] = list(result.messages)
@@ -1037,6 +1136,9 @@ def _extract_streamed_usage(buffered: str, protocol: str) -> Dict[str, Any]:
                 usage.update(obj["usage"])
         elif isinstance(obj.get("usage"), dict):
             usage.update(obj["usage"])
+        elif isinstance((obj.get("response") or {}).get("usage"), dict):
+            # Responses API: usage rides inside the response.completed event.
+            usage.update(obj["response"]["usage"])
     return usage
 
 
@@ -1044,10 +1146,11 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
     """Pull the assistant's answer out of relayed SSE frames.
 
     Raw ``data: {...}`` lines must never reach the cache — only the text the
-    model actually produced. Handles all three wire formats:
+    model actually produced. Handles all four wire formats:
       * openai    → choices[0].delta.content
       * anthropic → content_block_delta delta.text
       * gemini    → candidates[0].content.parts[].text
+      * responses → response.output_text.delta events
     """
     parts: List[str] = []
     for line in buffered.splitlines():
@@ -1077,6 +1180,12 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
         else:
+            if obj.get("type") == "response.output_text.delta":
+                # Responses API: text rides in typed events, not `choices`.
+                delta = obj.get("delta")
+                if isinstance(delta, str):
+                    parts.append(delta)
+                continue
             choices = obj.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
