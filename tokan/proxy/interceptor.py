@@ -23,6 +23,7 @@ Stdlib only — no third-party dependencies required to run the gateway.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import threading
@@ -278,6 +279,36 @@ class _Handler(BaseHTTPRequestHandler):
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
                 line += f" fallback={fallback}"
+            # Cache-miss diagnosis: which conversation part changed the digest.
+            # Two "identical" asks that log different part hashes (or different
+            # scope values) are genuinely different canonical payloads.
+            parts = ",".join(
+                hashlib.sha1(
+                    json.dumps(m, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                ).hexdigest()[:6]
+                for m in result.messages
+            )
+            scope_bits = "".join(
+                f" {k}={str(payload[k])[:32]}" for k in ("user", "temperature", "top_p") if payload.get(k) is not None
+            )
+            line += f" digest={rec['digest']} parts=[{parts}]{scope_bits}"
+            if result.volatile_scrubbed:
+                line += f" devol={result.volatile_scrubbed}"
+            # Log-only conversation preview (truncated): shows what each
+            # canonical message actually says — the fastest way to spot a
+            # client injecting per-thread noise. Never exposed on the wire.
+            prev = []
+            for i, m in enumerate(result.messages[:12]):
+                c = m.get("content")
+                if not isinstance(c, str):
+                    c = json.dumps(c, ensure_ascii=False, default=str)
+                if i < 3 and len(c) > 120:
+                    # Leading messages carry client-injected preambles; show
+                    # head+tail so per-thread volatile ids are visible.
+                    prev.append(f"{m.get('role', '?')}:{c[:160]}…{c[-80:]}")
+                else:
+                    prev.append(f"{m.get('role', '?')}:{c[:40]}")
+            line += f" convo=[{' | '.join(prev)}{' ...' if len(result.messages) > 12 else ''}]"
             print(line, flush=True)
 
     # ---------------------------------------------------------------- routes
@@ -295,6 +326,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "cache": self.pipeline.cache.stats(),
                 },
             )
+        elif self.path in ("/receipts", "/v1/receipts"):
+            # Rolling receipt window as JSON — the same rows the dashboard
+            # renders, for tooling and cache-miss diagnosis.
+            self._send_json(200, {"receipts": list(self.receipts)})
         elif self.path in ("/dashboard", "/v1/dashboard"):
             self._dashboard()
         else:

@@ -22,6 +22,7 @@ Content is stored as plain text and shaped per protocol at serve time.
 """
 
 import json
+import re
 import uuid as uuid_mod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -116,6 +117,31 @@ def responses_input_to_messages(input_value: Any) -> List[Dict[str, Any]]:
     return messages
 
 
+# Rotating identifiers clients embed in injected system preambles. Copilot, for
+# one, threads a per-thread id through its instructions: two byte-identical
+# asks in fresh chats then differ by exactly these tokens — same length,
+# different characters — which used to defeat the cache every time.
+_VOLATILE_PATTERNS = (
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b"), "<ts>"),
+    (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<hex>"),
+)
+
+
+def devolatile(text: str) -> "tuple[str, int]":
+    """Replace rotating identifiers with stable placeholders; returns (text, hits).
+
+    Fingerprint-scope only: applied to *system* messages before digesting, so
+    client-injected preamble noise stops changing the cache key. The forwarded
+    payload keeps the original bytes — the model sees exactly what was sent.
+    """
+    hits = 0
+    for rx, repl in _VOLATILE_PATTERNS:
+        text, n = rx.subn(repl, text)
+        hits += n
+    return text, hits
+
+
 def upstream_cached_tokens(response: Mapping[str, Any], *, protocol: str = "openai") -> int:
     """Tokens the *provider's* own prompt cache answered, across wire formats.
 
@@ -162,6 +188,10 @@ class PipelineResult:
     # baseline (``full_tokens``) and retrieval info so receipts/dashboard can
     # report "doc tokens avoided" against what a full resend would have cost.
     doc_savings: Optional[Dict[str, Any]] = None
+    # Count of rotating identifiers (uuid/ts/hex) scrubbed from system messages
+    # for the digest. Wire payload unchanged; >0 means client preamble noise was
+    # normalized away.
+    volatile_scrubbed: int = 0
 
     @property
     def route(self) -> str:
@@ -267,6 +297,24 @@ class OptimizationPipeline:
             messages = gemini_messages
             # Include model in scope so different models don't share cache entries.
             scope["model"] = payload.get("model", scope.get("model"))
+        # Fingerprint-scope de-volatilization: client-injected system preambles
+        # (Copilot's instructions, for one) thread rotating per-thread ids,
+        # timestamps and hex tokens through otherwise-identical asks — same
+        # length, different characters — which used to defeat the cache every
+        # time. Only *system* content is scrubbed, and only for the digest,
+        # prefix tracking and session keys; the forwarded wire payload keeps
+        # the original bytes, so the model sees exactly what was sent.
+        scrubbed: List[Dict[str, Any]] = []
+        volatile_hits = 0
+        for m in messages:
+            if m.get("role") == "system" and isinstance(m.get("content"), str):
+                text, n = devolatile(m["content"])
+                volatile_hits += n
+                scrubbed.append({**m, "content": text})
+            else:
+                scrubbed.append(dict(m))
+        if volatile_hits:
+            messages = scrubbed
         record = self.normalizer.fingerprint(messages, scope)
         # Session Governor: deterministic per-message strings + how much of this
         # payload repeats the previous turn's prefix (the base the provider's
@@ -286,6 +334,7 @@ class OptimizationPipeline:
                 cached_value=cached_value,
                 cached=True,
                 prefix_reuse=prefix_reuse,
+                volatile_scrubbed=volatile_hits,
             )
 
         query = self._last_user(messages)
@@ -310,6 +359,7 @@ class OptimizationPipeline:
             messages=self.normalizer.normalize_messages(messages),
             local_answer=answer,
             prefix_reuse=prefix_reuse,
+            volatile_scrubbed=volatile_hits,
         )
 
     # ------------------------------------------------------------- stage 3-4
