@@ -433,7 +433,9 @@ class _Handler(BaseHTTPRequestHandler):
             result.doc_savings = doc_savings
 
         # 1) Cache hit / deterministic local answer: zero upstream tokens.
-        if result.can_serve_locally:
+        # Responses API payloads (`input`, not `messages`) always go upstream —
+        # a chat-shaped local answer would be the wrong wire format.
+        if result.can_serve_locally and endpoint != "responses":
             response = self.pipeline.serve_local(
                 result, model=str(payload.get("model", "optimizer-local")), protocol=protocol
             )
@@ -468,6 +470,10 @@ class _Handler(BaseHTTPRequestHandler):
         """Map a request path to (protocol, endpoint)."""
         if path in ("/v1/chat/completions", "/chat/completions"):
             return "openai", "chat"
+        if path in ("/v1/responses", "/responses"):
+            # OpenAI Responses API (gpt-5/codex models that don't serve
+            # chat/completions) — forwarded with the same wire shape.
+            return "openai", "responses"
         if path in ("/v1/messages", "/messages"):
             return "anthropic", "messages"
         if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
@@ -794,8 +800,13 @@ class _Handler(BaseHTTPRequestHandler):
                 headers.pop("authorization", None)
             headers.setdefault("anthropic-version", self.headers.get("anthropic-version", "2023-06-01"))
         else:
-            forwarded["messages"] = list(result.messages)
-            url = self.config.upstream_base.rstrip("/") + "/chat/completions"
+            if endpoint == "responses":
+                # Responses API wire: keep `input` (and everything else)
+                # exactly as sent; only the URL changes.
+                url = self.config.upstream_base.rstrip("/") + "/responses"
+            else:
+                forwarded["messages"] = list(result.messages)
+                url = self.config.upstream_base.rstrip("/") + "/chat/completions"
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
         self._finalize_headers(headers)

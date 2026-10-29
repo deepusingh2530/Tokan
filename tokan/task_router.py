@@ -122,23 +122,33 @@ class AdaptiveTaskRouter:
 
     # -------------------------------------------------------------- model rewrites
 
-    def tier_model(self, tier: Union[str, None]) -> str:
-        """Cheapest acceptable model id for a tier (``"local"`` for Tier 0)."""
+    def tier_model(self, tier: Union[str, None], requested_model: Optional[str] = None) -> str:
+        """Cheapest acceptable model id for a tier (``"local"`` for Tier 0).
+
+        For Tier 2 the caller's requested model wins when given — the router
+        classifies complexity, it does not overrule an explicit model choice.
+        """
         if tier == TIER_LOCAL:
             return "local"
         if tier == TIER_LOW_COST:
             return self.low_cost_model
-        return self.frontier_model
+        return requested_model or self.frontier_model
 
-    def rewrite_payload(self, payload: dict, tier: str) -> dict:
-        """Rewrite the payload's model field for the chosen tier."""
+    def rewrite_payload(self, payload: dict, tier: str, requested_model: Optional[str] = None) -> dict:
+        """Rewrite the payload's model field for the chosen tier.
+
+        Any non-rewritten tier keeps the client's requested model; the router
+        still classifies, so cheap formatting still hits `gpt-4o-mini`, but a
+        frontier-complexity request keeps whatever the user asked for
+        (`gpt-5-codex`, `claude-3-5-sonnet`, …) without guessing.
+        """
         out = dict(payload or {})
         if tier == TIER_LOCAL:
             out["model"] = "local"
         elif tier == TIER_LOW_COST:
             out["model"] = self.low_cost_model
         elif tier == TIER_FRONTIER:
-            out["model"] = self.frontier_model
+            pass  # keep the client's requested model name intact
         out["optimized_tier"] = tier
         return out
 
@@ -150,7 +160,8 @@ class AdaptiveTaskRouter:
         engine make the final routing decision.
         """
         tier = self.classify(messages, payload=payload)
-        payload_out = self.rewrite_payload(payload, tier)
+        requested_model = (payload or {}).get("model") or (messages[0].get("content") if messages else "")
+        payload_out = self.rewrite_payload(payload, tier, requested_model=requested_model)
 
         decision = self.router.evaluate(messages, deterministic_answer=None)
 

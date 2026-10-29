@@ -260,6 +260,9 @@ class TestPipelineIntegration(unittest.TestCase):
         pipe.record_llm(r, response)
         self.assertEqual(pipe.metrics.provider_prompt_tokens, 500)
         self.assertEqual(pipe.metrics.upstream_cached_tokens, 300)
+        # Savings book the prompt only — the completion (10) is output the user
+        # would pay for in any world, never a Tokan saving.
+        self.assertEqual(pipe.metrics.optimized_tokens, 500)
         self.assertGreater(pipe.metrics.prefix_reused_tokens, 0)
         self.assertAlmostEqual(pipe.metrics.provider_cache_ratio, 0.6, places=4)
 
