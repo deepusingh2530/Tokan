@@ -38,6 +38,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 from ..cdm import estimate_tokens
 from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
 from .. import canonical
+from ..policy import CompressionPolicy
 from ..memory import ContextManifest, ConversationStore, content_digest
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
 from ..session import SESSION_HEADER
@@ -594,7 +595,14 @@ class _Handler(BaseHTTPRequestHandler):
         session_key = (self.headers.get(SESSION_HEADER) or "").strip() or None
         if doc_savings is not None:
             session_key = f"doc:{doc_savings['doc_id']}"
-        result = self.pipeline.prepare(payload, protocol=protocol, session_key=session_key)
+        # M3 compression policy: authority-protection in force for forwarded
+        # text. System/developer instructions, tool schemas and the user's ask
+        # are capped at lossless L1; only NORMAL/LOW content reaches L2/L3.
+        # The digest/prefix basis ignores this, so it never changes a cache key.
+        policy = CompressionPolicy()
+        result = self.pipeline.prepare(
+            payload, protocol=protocol, session_key=session_key, policy=policy
+        )
         if doc_savings is not None:
             result.doc_savings = doc_savings
 
@@ -941,7 +949,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _compact_responses_input(self, input_value: Any) -> Any:
+    def _compact_responses_input(self, input_value: Any, result: PipelineResult) -> Any:
         """Noise-strip text parts on the Responses wire, preserving item shape.
 
         Message items get their text parts compacted (ANSI, trailing whitespace,
@@ -950,10 +958,17 @@ class _Handler(BaseHTTPRequestHandler):
         collapse to an explicit marker so agent loops stop paying for the same
         tool dump every turn. Everything else — ``function_call``,
         ``reasoning``, images, plain strings — passes through untouched.
+
+        M3: the level applied per item is policy-gated, so a ``system``/
+        ``developer`` message item is capped at lossless L1 (instructions are
+        never rewritten) while tool outputs may reach L3 head/tail truncation.
         """
         compact = self.pipeline.normalizer.compact_text
+        policy = result.policy or CompressionPolicy()
         if isinstance(input_value, str):
-            return compact(input_value)
+            # A bare string input is the user's ask: HIGH authority, capped L2.
+            decision = policy.level_for(input_value, role="user")
+            return compact(input_value, level=int(decision.level))
         if not isinstance(input_value, list):
             return input_value
         out: List[Any] = []
@@ -964,12 +979,16 @@ class _Handler(BaseHTTPRequestHandler):
                 continue
             kind = item.get("type")
             if kind == "message":
+                # The item's role (system/developer/user/assistant) decides the
+                # authority cap; instructions are capped at lossless L1.
+                decision = policy.level_for("", role=str(item.get("role", "")))
+                mlevel: Optional[int] = int(decision.level)
                 content = item.get("content")
                 if isinstance(content, str):
-                    item = {**item, "content": compact(content)}
+                    item = {**item, "content": compact(content, level=mlevel)}
                 elif isinstance(content, list):
                     item = {**item, "content": [
-                        {**p, "text": compact(p["text"])}
+                        {**p, "text": compact(p["text"], level=mlevel)}
                         if isinstance(p, dict) and isinstance(p.get("text"), str) else p
                         for p in content
                     ]}
@@ -1026,14 +1045,21 @@ class _Handler(BaseHTTPRequestHandler):
             # The Gemini wire speaks `contents`, not `messages`. Compact each
             # text part in place; non-text parts (inline_data, function_call)
             # and the generationConfig/systemInstruction envelope pass through
-            # untouched — flattening them would corrupt the request.
+            # untouched — flattening them would corrupt the request. The system
+            # instruction travels separately (untouched); contents roles are
+            # user/model, both capped L2 by policy.
+            gpolicy = result.policy or CompressionPolicy()
             contents = []
             for c in payload.get("contents") or []:
+                gdecision = gpolicy.level_for("", role=str(c.get("role", "user")))
+                glevel: Optional[int] = int(gdecision.level)
                 parts = []
                 for part in c.get("parts") or []:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         parts.append(
-                            {**part, "text": self.pipeline.normalizer.compact_text(part["text"])}
+                            {**part, "text": self.pipeline.normalizer.compact_text(
+                                part["text"], level=glevel
+                            )}
                         )
                     elif isinstance(part, dict):
                         parts.append(part)
@@ -1071,7 +1097,7 @@ class _Handler(BaseHTTPRequestHandler):
                 # pass through untouched — flattening them would corrupt the
                 # request. Compaction is deterministic, so the prefix stays
                 # byte-stable and the provider's prompt cache can hit.
-                forwarded["input"] = self._compact_responses_input(payload.get("input"))
+                forwarded["input"] = self._compact_responses_input(payload.get("input"), result)
                 forwarded.pop("messages", None)
                 url = self.config.upstream_base.rstrip("/") + "/responses"
             else:

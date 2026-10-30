@@ -25,7 +25,10 @@ import json
 import re
 import uuid as uuid_mod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .policy import CompressionPolicy
 
 from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
@@ -220,6 +223,10 @@ class PipelineResult:
     # Doc Governor: set on /v1/doc/ask results. Carries the naive full-doc
     # baseline (``full_tokens``) and retrieval info so receipts/dashboard can
     # report "doc tokens avoided" against what a full resend would have cost.
+    # Compression policy (M3): the authority-protection policy in force for the
+    # *forwarded* messages. Digest/prefix computations ignore it by design, so
+    # adopting a stricter policy can never change a cache key.
+    policy: Optional["CompressionPolicy"] = None
     doc_savings: Optional[Dict[str, Any]] = None
     # Count of rotating identifiers (uuid/ts/hex) scrubbed from system messages
     # for the digest. Wire payload unchanged; >0 means client preamble noise was
@@ -288,6 +295,7 @@ class OptimizationPipeline:
         *,
         protocol: str = "openai",
         session_key: Optional[str] = None,
+        policy: Optional["CompressionPolicy"] = None,
     ) -> PipelineResult:
         """Run CDM + cache probe + JeV decision. Does NOT touch the LLM.
 
@@ -353,11 +361,12 @@ class OptimizationPipeline:
                 record=record,
                 decision=decision,
                 cache_key=record.digest,
-                messages=self.normalizer.normalize_messages(messages),
+                messages=self.normalizer.normalize_messages(messages, policy=policy),
                 cached_value=cached_value,
                 cached=True,
                 prefix_reuse=prefix_reuse,
                 volatile_scrubbed=volatile_hits,
+                policy=policy,
             )
 
         query = self._last_user(messages)
@@ -379,10 +388,11 @@ class OptimizationPipeline:
             record=record,
             decision=decision,
             cache_key=record.digest,
-            messages=self.normalizer.normalize_messages(messages),
+            messages=self.normalizer.normalize_messages(messages, policy=policy),
             local_answer=answer,
             prefix_reuse=prefix_reuse,
             volatile_scrubbed=volatile_hits,
+            policy=policy,
         )
 
     # ------------------------------------------------------------- stage 3-4
