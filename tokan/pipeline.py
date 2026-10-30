@@ -24,11 +24,12 @@ Content is stored as plain text and shaped per protocol at serve time.
 import json
 import re
 import uuid as uuid_mod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .policy import CompressionPolicy
+    from .governor import ContextGovernor, GovernorPlan, SemanticAnswerCache
 
 from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
@@ -227,6 +228,18 @@ class PipelineResult:
     # *forwarded* messages. Digest/prefix computations ignore it by design, so
     # adopting a stricter policy can never change a cache key.
     policy: Optional["CompressionPolicy"] = None
+    # Context Governor (M4): the token-budget decision for this request. Pure
+    # measurement until the request would overflow the model's window — only
+    # then does it shed context, and never required context. Computed after the
+    # digest, so it cannot change a cache key.
+    governor_plan: Optional["GovernorPlan"] = None
+    #: Last user question, verbatim. Feeds the semantic answer cache (M4) so a
+    #: near-identical re-ask can be served without an upstream call.
+    query: str = ""
+    #: True when this result was served by the semantic answer cache rather
+    #: than an exact digest hit. Kept separate so the digest cache's own hit
+    #: rate stays honest — a fuzzy match is not an exact repeat.
+    semantic: bool = False
     doc_savings: Optional[Dict[str, Any]] = None
     # Count of rotating identifiers (uuid/ts/hex) scrubbed from system messages
     # for the digest. Wire payload unchanged; >0 means client preamble noise was
@@ -257,6 +270,14 @@ class OptimizationPipeline:
     session: SessionTracker = field(default_factory=SessionTracker)
     # Doc Governor: ingest-once document store backing /v1/ingest + /v1/doc/ask.
     documents: DocumentStore = field(default_factory=DocumentStore)
+    # Context Governor (M4): token-budget controller. ``None`` (the default)
+    # reproduces pre-M4 behaviour byte-for-byte — no budget is computed and no
+    # context is ever shed. When set, it only acts on requests that would
+    # otherwise overflow the model's context window.
+    governor: Optional["ContextGovernor"] = None
+    # Semantic answer cache (M4): conservative, opt-in near-identical-question
+    # reuse. Off unless explicitly enabled; every hit is counted separately.
+    semantic_cache: Optional["SemanticAnswerCache"] = None
     # Scope keys that change the answer (and therefore the cache key).
     scope_keys: tuple = ("model", "temperature", "top_p", "user")
 
@@ -294,12 +315,16 @@ class OptimizationPipeline:
         payload: Mapping[str, Any],
         *,
         protocol: str = "openai",
+        endpoint: str = "",
         session_key: Optional[str] = None,
         policy: Optional["CompressionPolicy"] = None,
     ) -> PipelineResult:
         """Run CDM + cache probe + JeV decision. Does NOT touch the LLM.
 
         ``protocol`` is ``"openai"``, ``"anthropic"``, or ``"gemini"``.
+        ``endpoint`` refines the wire within a protocol (``"responses"`` vs the
+        default chat completions on the ``openai`` protocol); it decides which
+        native array the Context Governor may shed.
 
         * ``"openai"``: standard chat-completions payload with ``messages``.
         * ``"anthropic"``: Messages API payload with top-level ``system`` field;
@@ -383,17 +408,125 @@ class OptimizationPipeline:
                 estimated_llm_tokens=record.canonical_tokens,
             )
 
+        # Semantic answer cache (M4): only consulted when the request is
+        # otherwise bound for the LLM, so an exact digest hit or a
+        # deterministic local answer always outranks a fuzzy match. The probe
+        # is gated on a high similarity threshold and a task-class check (only
+        # self-contained factual questions qualify); anything else falls
+        # through to the LLM untouched.
+        semantic_hit: Optional[Tuple[str, float]] = None
+        if self.semantic_cache is not None and decision.route == "llm":
+            semantic_hit = self.semantic_cache.probe(
+                query, model=str(payload.get("model", ""))
+            )
+            if semantic_hit is not None:
+                decision = JevDecision(
+                    route="cache",
+                    confidence=1.0,
+                    signals=("semantic_hit", f"similarity={semantic_hit[1]}"),
+                )
+                return PipelineResult(
+                    request=dict(payload),
+                    record=record,
+                    decision=decision,
+                    cache_key=record.digest,
+                    messages=self.normalizer.normalize_messages(messages, policy=policy),
+                    cached_value=semantic_hit[0],
+                    cached=True,
+                    semantic=True,
+                    prefix_reuse=prefix_reuse,
+                    volatile_scrubbed=volatile_hits,
+                    policy=policy,
+                    query=query,
+                )
+
+        # Context Governor (M4): compute the token budget and, only if the
+        # request would overflow the model's context window, shed the least
+        # valuable context units. This runs *after* the digest above, so the
+        # cache key is already fixed and shedding can never invalidate an
+        # earlier entry or change this request's own key.
+        #
+        # Under budget (the overwhelmingly common case) this is pure
+        # measurement: `applied` stays False and `messages` is untouched.
+        plan: Optional["GovernorPlan"] = None
+        forwarded_messages: Sequence[Mapping[str, Any]] = messages
+        if self.governor is not None:
+            plan = self.governor.plan(
+                messages,
+                model=str(payload.get("model", "")),
+                overhead_tokens=self._governor_overhead(payload, protocol=protocol),
+                output_reserve=self._governor_reserve(payload),
+            )
+            # Shed only where `messages` *is* the forwarded array (chat and
+            # anthropic). Gemini forwards `contents` and Responses forwards
+            # `input`, whose native indices don't align with the projected
+            # message list — shedding here would silently no-op or, worse,
+            # desynchronise typed items. Those wires keep the full history and
+            # only get the budget measurement in M4.
+            sheddable = protocol in ("openai", "anthropic") and endpoint != "responses"
+            if plan.applied and sheddable:
+                forwarded_messages = self.governor.apply(messages, plan)
+            elif plan.applied:
+                # Decision was "shed" but this wire can't honour it: record the
+                # measurement without claiming bytes changed.
+                plan = replace(plan, applied=False)
+
         return PipelineResult(
             request=dict(payload),
             record=record,
             decision=decision,
             cache_key=record.digest,
-            messages=self.normalizer.normalize_messages(messages, policy=policy),
+            messages=self.normalizer.normalize_messages(
+                forwarded_messages, policy=policy
+            ),
             local_answer=answer,
             prefix_reuse=prefix_reuse,
             volatile_scrubbed=volatile_hits,
             policy=policy,
+            governor_plan=plan,
+            query=query,
         )
+
+    def _governor_overhead(
+        self, payload: Mapping[str, Any], *, protocol: str = "openai"
+    ) -> int:
+        """Tokens the governor may never shed: tool schemas + system prompt.
+
+        These sit outside the sheddable message list (tool schemas are a
+        top-level array; Anthropic carries ``system`` separately; Gemini uses
+        ``systemInstruction``), so they are weighed once here rather than
+        competing with conversation units for space.
+        """
+        overhead = 0
+        tools = payload.get("tools")
+        if tools:
+            overhead += estimate_tokens(self.normalizer.canonical_json(tools))
+        if protocol == "anthropic":
+            system = payload.get("system")
+            if isinstance(system, str):
+                overhead += estimate_tokens(system)
+            elif isinstance(system, list):
+                overhead += estimate_tokens(self.normalizer.canonical_json(system))
+        if protocol == "gemini":
+            instruction = payload.get("systemInstruction")
+            if instruction:
+                overhead += estimate_tokens(self.normalizer.canonical_json(instruction))
+        return overhead
+
+    @staticmethod
+    def _governor_reserve(payload: Mapping[str, Any]) -> Optional[int]:
+        """Completion reservation: the client's own ``max_tokens`` if present.
+
+        A request that already declares how much output it wants gets exactly
+        that much set aside; otherwise the governor's configured default
+        applies. This is the difference between "fits" and "the provider 400s
+        because input ate the completion's room".
+        """
+        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            value = payload.get(key)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
 
     # ------------------------------------------------------------- stage 3-4
     def serve_local(
@@ -407,7 +540,11 @@ class OptimizationPipeline:
         """Build a protocol-shaped response for a cache/local hit and book it."""
         if result.cached:
             content = result.cached_value
-            route = "cache"
+            # A semantic hit is a *fuzzy* match, not an exact digest repeat.
+            # Booking it under "cache" would inflate the digest cache's hit
+            # rate, so it gets its own route — same zero-token economics,
+            # honest accounting.
+            route = "semantic" if result.semantic else "cache"
         else:
             content = result.local_answer or ""
             route = "local"
@@ -474,6 +611,16 @@ class OptimizationPipeline:
             # Cache the plain text answer; shaping happens at serve time, so
             # an answer cached via Anthropic can be served via OpenAI too.
             self.cache.set(result.cache_key, content)
+            # Semantic answer cache (M4): remember this answer against the
+            # question that produced it, so a near-identical re-ask (a
+            # paraphrase, or one whose volatile bits differ) can be served
+            # without a second upstream call. Only self-contained factual
+            # questions are eligible — see SemanticAnswerCache.eligible.
+            if self.semantic_cache is not None and result.query:
+                self.semantic_cache.store(
+                    result.query, content,
+                    model=str(result.request.get("model", "")),
+                )
 
     def record_doc(self, result: PipelineResult, *, sent_tokens: int) -> None:
         """Book Doc Governor economics for a /v1/doc/ask result.

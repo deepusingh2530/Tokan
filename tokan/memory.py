@@ -433,8 +433,10 @@ class ContextManifest:
     """What actually happened to one request's context.
 
     M1 records what the gateway genuinely knows today (route, tokens, cache,
-    scrubbing, protected system messages). ``omitted`` stays empty until the
-    Context Governor can honestly report omission decisions.
+    scrubbing, protected system messages). ``omitted`` is populated by the
+    Context Governor (M4) when it sheds context to fit a model's window —
+    it lists the message indices withheld from the provider, so an omission
+    is always auditable after the fact.
     """
 
     rid: str
@@ -460,6 +462,9 @@ class ContextManifest:
     policy: Dict[str, Any] = field(
         default_factory=lambda: {"version": POLICY_VERSION, "levels": ["L1", "L2"]}
     )
+    #: Context Governor budget decision (M4): window, reserve, what was shed.
+    #: Empty dict when the governor is off or the request fit its budget.
+    governor: Dict[str, Any] = field(default_factory=dict)
     risk: str = "low"
 
     def as_dict(self) -> Dict[str, Any]:
@@ -483,5 +488,6 @@ class ContextManifest:
             "omitted": list(self.omitted),
             "canonical": dict(self.canonical),
             "policy": dict(self.policy),
+            "governor": dict(self.governor),
             "risk": self.risk,
         }

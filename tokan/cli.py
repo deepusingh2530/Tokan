@@ -145,13 +145,33 @@ def cmd_serve(args: argparse.Namespace) -> int:
 def _build_pipeline(args: argparse.Namespace):
     from .pipeline import OptimizationPipeline
 
-    return OptimizationPipeline.with_cdn(
+    pipeline = OptimizationPipeline.with_cdn(
         getattr(args, "cdn", None),
         namespace=getattr(args, "namespace", "default"),
         confidence_threshold=getattr(args, "threshold", 0.88),
         price_per_million_tokens=getattr(args, "price", 2.50),
         cache_db=getattr(args, "cache_db", None),
     )
+    # Context Governor (M4): opt-in. Only ever acts when a request would
+    # overflow the model's context window — see tokan/governor.py.
+    if getattr(args, "governor", False):
+        from .governor import ContextGovernor
+
+        pipeline.governor = ContextGovernor(
+            context_window=getattr(args, "context_window", None),
+            output_reserve=getattr(args, "output_reserve", 4096),
+            recent_window=getattr(args, "recent_window", 6),
+        )
+    # Semantic answer cache (M4): opt-in, conservative. Stores answers in
+    # memory only — a restart clears it, which is the safe direction.
+    if getattr(args, "semantic_cache", False):
+        from .governor import SemanticAnswerCache
+
+        pipeline.semantic_cache = SemanticAnswerCache(
+            enabled=True,
+            threshold=getattr(args, "semantic_threshold", 0.97),
+        )
+    return pipeline
 
 
 # ---------------------------------------------------------------------- mcp
@@ -271,6 +291,25 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--conversation-db", default=None,
                        help="sqlite file for the append-only conversation store "
                             "(observe-only memory: records events + manifests, never serves them)")
+        p.add_argument("--governor", action="store_true",
+                       help="Context Governor: when a request would overflow the model's "
+                            "context window, shed low-value context (never instructions, "
+                            "tool schemas or the user's ask) instead of forwarding a payload "
+                            "the provider would reject with a 400. Off by default.")
+        p.add_argument("--context-window", type=int, default=None,
+                       help="override the built-in per-model context window (tokens); "
+                            "set when your deployment's real limit differs from the table")
+        p.add_argument("--output-reserve", type=int, default=4096,
+                       help="completion tokens to reserve before admitting input "
+                            "(a request's own max_tokens wins; default 4096)")
+        p.add_argument("--recent-window", type=int, default=6,
+                       help="trailing messages treated as the high-value working set (default 6)")
+        p.add_argument("--semantic-cache", action="store_true",
+                       help="Semantic answer cache: reuse a near-identical previous answer "
+                            "for self-contained factual questions. Conservative + opt-in: "
+                            "only matches above --semantic-threshold are served.")
+        p.add_argument("--semantic-threshold", type=float, default=0.97,
+                       help="risk threshold for semantic reuse (default 0.97 = near-paraphrase only)")
 
     p_serve = sub.add_parser("serve", help="run the optimization gateway")
     add_gateway_flags(p_serve)

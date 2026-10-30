@@ -165,6 +165,9 @@ class ProxyConfig:
     #: Optional SQLite file for the append-only conversation store
     #: (observe-only memory: records events + manifests, never serves them).
     conversation_db: Optional[str] = None
+    # Context Governor and semantic answer cache (M4) live on the pipeline
+    # (see tokan/cli.py::_build_pipeline) — they act inside prepare(), not at
+    # the wire, so the config stays a transport concern only.
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -202,7 +205,8 @@ class _Handler(BaseHTTPRequestHandler):
         # (including streams, whose body is SSE chunks we don't rewrite).
         ds = result.doc_savings
         if ds:
-            sent = 0 if result.decision.route in ("cache", "local") else result.record.canonical_tokens
+            # Semantic hits serve from the answer cache too — zero bytes out.
+            sent = 0 if result.decision.route in ("cache", "local", "semantic") else result.record.canonical_tokens
             avoided = max(0, int(ds.get("full_tokens", 0)) - sent)
             out["X-Optimizer-Doc-Id"] = str(ds.get("doc_id", ""))
             out["X-Optimizer-Doc-Avoided-Tokens"] = str(avoided)
@@ -242,8 +246,8 @@ class _Handler(BaseHTTPRequestHandler):
         # resend (what the client would have paid without retrieval).
         ds = result.doc_savings
         original = int(ds.get("full_tokens", 0)) if ds else result.record.original_tokens
-        # What actually left the machine: cache/local hits send nothing.
-        sent = 0 if route in ("cache", "local") else result.record.canonical_tokens
+        # What actually left the machine: cache/local/semantic hits send nothing.
+        sent = 0 if route in ("cache", "local", "semantic") else result.record.canonical_tokens
         saved_pct = round(100.0 * (original - sent) / original, 2) if original else 0.0
         overhead = max(0.0, ms - upstream_ms)
         pr = result.prefix_reuse
@@ -270,6 +274,14 @@ class _Handler(BaseHTTPRequestHandler):
             "doc_id": ds.get("doc_id", "") if ds else "",
             "fallback": fallback,
         }
+        # Context Governor (M4): budget decision, only when the governor ran.
+        # Additive keys — a governor-off receipt is byte-identical to M3's.
+        plan = result.governor_plan
+        if plan is not None:
+            rec["governor"] = plan.as_dict()
+        if result.semantic:
+            # Fuzzy answer reuse — surfaced separately from the digest cache.
+            rec["semantic"] = True
         # Conversation memory: a request id ties receipt, manifest and events
         # together. Only added when the store is on, so flag-off receipts stay
         # byte-identical to prior releases.
@@ -296,6 +308,10 @@ class _Handler(BaseHTTPRequestHandler):
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
                 line += f" fallback={fallback}"
+            if plan is not None and plan.applied:
+                line += f" shed={plan.shed_tokens}tok/{plan.shed_units}u"
+            if result.semantic:
+                line += " semantic_hit"
             # Cache-miss diagnosis: which conversation part changed the digest.
             # Two "identical" asks that log different part hashes (or different
             # scope values) are genuinely different canonical payloads.
@@ -418,7 +434,8 @@ class _Handler(BaseHTTPRequestHandler):
                 digest=result.record.digest[:16],
                 original_tokens=result.record.original_tokens,
                 optimized_tokens=(
-                    0 if route in ("cache", "local") else result.record.canonical_tokens
+                    0 if route in ("cache", "local", "semantic")
+                    else result.record.canonical_tokens
                 ),
                 cache_hit=bool(result.cached),
                 volatile_scrubbed=int(result.volatile_scrubbed),
@@ -435,6 +452,17 @@ class _Handler(BaseHTTPRequestHandler):
                     {"devolatilized": int(result.volatile_scrubbed)}
                     if result.volatile_scrubbed
                     else {}
+                ),
+                # Context Governor (M4): the budget decision, and exactly which
+                # message indices were withheld from the provider. Empty when
+                # the request fit its window — the common case.
+                omitted=(
+                    [str(i) for i in result.governor_plan.shed]
+                    if result.governor_plan and result.governor_plan.shed
+                    else []
+                ),
+                governor=(
+                    result.governor_plan.as_dict() if result.governor_plan else {}
                 ),
                 canonical=canonical_stats,
             )
@@ -518,7 +546,7 @@ class _Handler(BaseHTTPRequestHandler):
  table {{ border-collapse:collapse; width:100%; margin-top:.5rem; }}
  th,td {{ padding:.3rem .6rem; border-bottom:1px solid #21262d; text-align:left; }}
  th {{ color:#8b949e; font-size:11px; text-transform:uppercase; }}
- .rt-cache {{ color:#3fb950; }} .rt-local {{ color:#58a6ff; }} .rt-llm {{ color:#d29922; }}
+ .rt-cache {{ color:#3fb950; }} .rt-local {{ color:#58a6ff; }} .rt-llm {{ color:#d29922; }} .rt-semantic {{ color:#bc8cff; }}
  .empty {{ color:#8b949e; font-style:italic; }}
  .lat {{ color:#8b949e; font-size:11px; white-space:nowrap; }}
 </style></head><body>
@@ -526,6 +554,10 @@ class _Handler(BaseHTTPRequestHandler):
 <div class="cards">
  <div class="card"><div class="k">Requests</div><div class="v">{esc(m['requests'])}</div></div>
  <div class="card"><div class="k">Cache hits</div><div class="v">{esc(m['cache_hits'])}</div></div>
+ <div class="card"><div class="k">Semantic hits</div><div class="v" title="Near-identical questions served from the answer cache (fuzzy reuse — separate from exact digest hits)">{esc(m.get('semantic_cache_hits', 0))}</div></div>
+ <div class="card"><div class="k">Governor sheds</div><div class="v" title="Requests where context was shed to fit the model's window (never instructions, schemas or the ask)">{esc(m.get('governor_sheds', 0))}</div></div>
+ <div class="card"><div class="k">Shed tokens</div><div class="v" title="Estimated tokens withheld from the provider to fit the window (our estimate — not counted in Tokens saved)">{esc(m.get('governor_shed_tokens', 0))}</div></div>
+ <div class="card"><div class="k">Overflows</div><div class="v" title="Requests whose required context alone exceeded the window (forwarded unchanged; provider decides)">{esc(m.get('governor_overflows', 0))}</div></div>
  <div class="card"><div class="k">Local solves</div><div class="v">{esc(m['local_solves'])}</div></div>
  <div class="card"><div class="k">LLM calls</div><div class="v">{esc(m['llm_calls'])}</div></div>
  <div class="card"><div class="k">Tokens saved</div><div class="v">{esc(m['tokens_saved'])}</div></div>
@@ -601,8 +633,17 @@ class _Handler(BaseHTTPRequestHandler):
         # The digest/prefix basis ignores this, so it never changes a cache key.
         policy = CompressionPolicy()
         result = self.pipeline.prepare(
-            payload, protocol=protocol, session_key=session_key, policy=policy
+            payload, protocol=protocol, endpoint=endpoint,
+            session_key=session_key, policy=policy,
         )
+        # Context Governor (M4): book the outcome. Under budget this is a
+        # no-op; when context was shed (or required context alone overflowed)
+        # the counters make it visible without touching tokens_saved.
+        plan = result.governor_plan
+        if plan is not None and (plan.applied or plan.overflow):
+            self.pipeline.metrics.record_governor(
+                shed_tokens=plan.shed_tokens, overflow=plan.overflow
+            )
         if doc_savings is not None:
             result.doc_savings = doc_savings
 
@@ -629,7 +670,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, response, extra=self._route_headers(result))
             self._record_receipt(
                 payload, result,
-                route=result.decision.route, status=200,
+                # A semantic hit is a fuzzy reuse, not an exact digest repeat —
+                # book it under its own route so the dashboard's cache-hit
+                # rate stays honest.
+                route=("semantic" if result.semantic else result.decision.route),
+                status=200,
                 ms=(time.perf_counter() - started) * 1000,
                 upstream_ms=0.0,
                 protocol=protocol,

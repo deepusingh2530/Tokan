@@ -23,8 +23,15 @@ class SessionMetrics:
         self._lock = threading.RLock()
         self.requests = 0
         self.cache_hits = 0
+        self.semantic_cache_hits = 0  # fuzzy answer reuse (M4), separate from digest hits
         self.local_solves = 0
         self.llm_calls = 0
+        # Context Governor (M4): requests where context was shed to fit the
+        # model's window, tokens withheld (our estimate, never in tokens_saved),
+        # and requests whose *required* context alone overflowed the window.
+        self.governor_sheds = 0
+        self.governor_shed_tokens = 0
+        self.governor_overflows = 0
         self.original_tokens = 0
         self.optimized_tokens = 0
         self.upstream_cached_tokens = 0  # provider prompt-cache hits (surfaced, not ours)
@@ -45,12 +52,30 @@ class SessionMetrics:
             self.requests += 1
             if route == "cache":
                 self.cache_hits += 1
+            elif route == "semantic":
+                # Fuzzy answer reuse. Booked separately from the digest cache
+                # so the exact-match hit rate stays honest.
+                self.semantic_cache_hits += 1
             elif route == "local":
                 self.local_solves += 1
             else:
                 self.llm_calls += 1
             self.original_tokens += max(0, int(original_tokens))
             self.optimized_tokens += max(0, int(optimized_tokens))
+
+    def record_governor(self, *, shed_tokens: int, overflow: bool) -> None:
+        """One request's Context Governor outcome (M4).
+
+        ``shed_tokens`` is our own estimate of context withheld from the
+        provider to fit the model's window; it is *not* provider-verified, so
+        it never enters ``tokens_saved`` — that claim stays on measured
+        compaction savings only.
+        """
+        with self._lock:
+            self.governor_sheds += 1
+            self.governor_shed_tokens += max(0, int(shed_tokens))
+            if overflow:
+                self.governor_overflows += 1
 
     def record_upstream_cached(self, tokens: int) -> None:
         """Tokens the *provider's* prompt cache answered (billed at a discount).
@@ -163,8 +188,12 @@ class SessionMetrics:
             return {
                 "requests": self.requests,
                 "cache_hits": self.cache_hits,
+                "semantic_cache_hits": self.semantic_cache_hits,
                 "local_solves": self.local_solves,
                 "llm_calls": self.llm_calls,
+                "governor_sheds": self.governor_sheds,
+                "governor_shed_tokens": self.governor_shed_tokens,
+                "governor_overflows": self.governor_overflows,
                 "original_tokens": self.original_tokens,
                 "optimized_tokens": self.optimized_tokens,
                 "tokens_saved": self.tokens_saved,
@@ -190,8 +219,12 @@ class SessionMetrics:
         with self._lock:
             self.requests = 0
             self.cache_hits = 0
+            self.semantic_cache_hits = 0
             self.local_solves = 0
             self.llm_calls = 0
+            self.governor_sheds = 0
+            self.governor_shed_tokens = 0
+            self.governor_overflows = 0
             self.original_tokens = 0
             self.optimized_tokens = 0
             self.upstream_cached_tokens = 0
