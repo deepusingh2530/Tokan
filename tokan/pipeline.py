@@ -25,7 +25,7 @@ import json
 import re
 import uuid as uuid_mod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
@@ -37,7 +37,7 @@ from .session import PrefixReuse, SessionTracker
 __all__ = [
     "OptimizationPipeline", "PipelineResult", "LocalExecutor",
     "upstream_cached_tokens", "usage_cached_tokens", "responses_input_to_messages",
-    "PrefixReuse", "SessionTracker", "DocumentStore",
+    "scrub_for_digest", "PrefixReuse", "SessionTracker", "DocumentStore",
 ]
 
 
@@ -148,6 +148,31 @@ def devolatile(text: str) -> "tuple[str, int]":
         text, n = rx.subn(repl, text)
         hits += n
     return text, hits
+
+
+def scrub_for_digest(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """De-volatilize a projected message list for the digest; returns (messages, hits).
+
+    Only *system* string content is scrubbed (uuid/timestamp/hex tokens),
+    plus Copilot's ``<current_datetime>`` envelope in any string content —
+    and only in the returned copy: wire bytes are never touched. Extracted
+    from ``prepare()`` so the canonical-model parity tests exercise the exact
+    digest basis rather than a re-implementation that could drift.
+    """
+    scrubbed: List[Dict[str, Any]] = []
+    volatile_hits = 0
+    for m in messages:
+        content = m.get("content")
+        if m.get("role") == "system" and isinstance(content, str):
+            text, n = devolatile(content)
+            volatile_hits += n
+            scrubbed.append({**m, "content": text})
+        elif isinstance(content, str) and _DATETIME_ENVELOPE.search(content):
+            scrubbed.append({**m, "content": _DATETIME_ENVELOPE.sub("<current_datetime/>", content)})
+            volatile_hits += 1
+        else:
+            scrubbed.append(dict(m))
+    return (scrubbed if volatile_hits else messages), volatile_hits
 
 
 def upstream_cached_tokens(response: Mapping[str, Any], *, protocol: str = "openai") -> int:
@@ -312,21 +337,7 @@ class OptimizationPipeline:
         # time. Only *system* content is scrubbed, and only for the digest,
         # prefix tracking and session keys; the forwarded wire payload keeps
         # the original bytes, so the model sees exactly what was sent.
-        scrubbed: List[Dict[str, Any]] = []
-        volatile_hits = 0
-        for m in messages:
-            content = m.get("content")
-            if m.get("role") == "system" and isinstance(content, str):
-                text, n = devolatile(content)
-                volatile_hits += n
-                scrubbed.append({**m, "content": text})
-            elif isinstance(content, str) and _DATETIME_ENVELOPE.search(content):
-                scrubbed.append({**m, "content": _DATETIME_ENVELOPE.sub("<current_datetime/>", content)})
-                volatile_hits += 1
-            else:
-                scrubbed.append(dict(m))
-        if volatile_hits:
-            messages = scrubbed
+        messages, volatile_hits = scrub_for_digest(messages)
         record = self.normalizer.fingerprint(messages, scope)
         # Session Governor: deterministic per-message strings + how much of this
         # payload repeats the previous turn's prefix (the base the provider's
