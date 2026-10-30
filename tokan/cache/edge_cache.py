@@ -114,14 +114,17 @@ class EdgeCache:
 
         remote_value = self._remote_get(key) if self.config.endpoint else None
         if remote_value is not None:
-            self.remote_hits += 1
+            with self._lock:
+                self.remote_hits += 1
         else:
             remote_value = self._store_get(key)
 
         if remote_value is None:
-            self.misses += 1
+            with self._lock:
+                self.misses += 1
             return None
-        self.hits += 1
+        with self._lock:
+            self.hits += 1
         self._lru_put(key, remote_value)
         return remote_value
 

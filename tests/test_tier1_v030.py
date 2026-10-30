@@ -370,5 +370,63 @@ class TestDiffCompaction(unittest.TestCase):
         self.assertIn("+added line", out)
 
 
+class TestSessionMetricsThreadSafety(unittest.TestCase):
+    """M2: the threaded gateway books metrics from many handler threads."""
+
+    def test_concurrent_records_are_not_lost(self):
+        import threading
+
+        from tokan.metrics import SessionMetrics
+
+        metrics = SessionMetrics()
+        threads = [
+            threading.Thread(
+                target=lambda: [
+                    (
+                        metrics.record("llm", 100, 80),
+                        metrics.record("cache", 50, 0),
+                        metrics.record_provider_prompt(100, 40),
+                        metrics.record_fallback(),
+                    )
+                    for _ in range(250)
+                ],
+            )
+            for _ in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        snapshot = metrics.as_dict()
+        # 8 threads x 250 iterations x 2 record() calls each.
+        self.assertEqual(snapshot["requests"], 4000)
+        self.assertEqual(snapshot["llm_calls"], 2000)
+        self.assertEqual(snapshot["cache_hits"], 2000)
+        self.assertEqual(snapshot["fallbacks"], 2000)
+        # 8 threads x 250 x 100 prompt tokens — exact under the lock.
+        self.assertEqual(snapshot["provider_prompt_tokens"], 200000)
+        self.assertEqual(snapshot["upstream_cached_tokens"], 80000)
+
+    def test_concurrent_edge_cache_counters(self):
+        import threading
+
+        cache = EdgeCache(CDNConfig(), max_entries=64)
+
+        def hammer():
+            for i in range(200):
+                cache.set(f"k{i % 32}", i)
+                cache.get(f"k{i % 32}")
+                cache.get("missing-key")
+
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        stats = cache.stats()
+        # Every operation accounted: gets = hits + misses, exactly.
+        self.assertEqual(stats["hits"] + stats["misses"], 3200)
+
+
 if __name__ == "__main__":
     unittest.main()
