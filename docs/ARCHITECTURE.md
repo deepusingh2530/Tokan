@@ -1,13 +1,13 @@
 # Tokan Architecture
 
-Status: living document. Milestone M1 landed; later milestones referenced by phase.
+Status: living document. Milestones M1–M4 landed; later milestones referenced by phase.
 
 Tokan is a provider-neutral token-optimization gateway for AI coding agents. It sits
 between agents (Copilot BYOK, Codex, Aider, Gemini CLI, any OpenAI/Anthropic/Gemini
 wire client) and upstream LLM providers, minimizing tokens sent upstream while
 preserving answer quality and full recoverability of the original context.
 
-## 1. Current assessment (as of M1)
+## 1. Current assessment (as of M4)
 
 What exists and works today, verified by tests and live traffic:
 
@@ -26,9 +26,10 @@ What exists and works today, verified by tests and live traffic:
 | Metrics/receipts/dashboard | `tokan/metrics.py` + `/metrics`, `/receipts`, `/dashboard`, `X-Optimizer-*` headers, per-request receipts with token-accurate honest accounting | production (per-process) |
 | MCP tools | `tokan/mcp.py`: 7 stdio tools (optimize, repo_index, cache, metrics, doc) | production |
 | Deploy | `deploy/azure/main.bicep` (ACA + Redis + Key Vault), Dockerfile | production |
-| Conversation persistence | none — history lives only in agent clients | **missing** |
-| Context manifest | partial — receipts carry tokens/route/digest but no evidence ledger | **partial** |
-| Context governor / budget | none — compaction applied uniformly; no context-limit awareness | **missing** |
+| Conversation persistence | `tokan/memory.py` (M1): append-only SQLite `ConversationStore` + deterministic `ConversationState`, observe-only behind `--conversation-db` | production (fail-open) |
+| Context manifest | `ContextManifest` per request: route, tokens, digest, protected/compressed/omitted, canonical + policy + governor stats | production |
+| Context governor / budget | `tokan/governor.py` (M4): per-model windows, output reserve, utility-class shedding of `messages` wires under `--governor` (opt-in) | production (opt-in) |
+| Semantic answer cache | `SemanticAnswerCache` (M4): factual-only, model-scoped, high-threshold fuzzy reuse under `--semantic-cache` (opt-in) | production (opt-in) |
 | Quality gate / progressive expansion | none | **missing** |
 | Authentication / tenant isolation | none — gateway is open; single-tenant cache scope | **missing** (tracked, phase 6) |
 
@@ -50,26 +51,26 @@ Numbering follows the target module list in the master plan.
 | 3 | Canonical request model | `tokan/canonical.py` (M2) | pipeline adoption in M3 (governor consumes `fingerprint_view`) |
 | 4 | Content classifier | `tokan/policy.py` (M3) | typed classes + authority tiers; user/system capped L1 |
 | 5 | Secret protector | none | secret detection/redaction (M6) |
-| 6 | Conversation store | — | **M1 (this milestone)** |
-| 7 | Conversation state extractor | — | **M1 (deterministic subset)** |
-| 8 | Context Governor | CDM compaction, applied uniformly | utility-per-token selection, required-context protection (M4) |
+| 6 | Conversation store | `tokan/memory.py` (M1) | done |
+| 7 | Conversation state extractor | `ConversationState` (M1, deterministic) | done |
+| 8 | Context Governor | `tokan/governor.py` (M4) | progressive expansion loop (M6); gemini/responses shedding (M6) |
 | 9 | Repository intelligence | repo_index map | symbols/calls/tests graph, incremental (M5) |
 | 10 | Document intelligence | doc.py TF-IDF | semantic retrieval, coverage detection (M5) |
-| 11 | Relevance/dependency retriever | doc TF-IDF only | cross-store retrieval (M4–M5) |
-| 12 | Token Budget Controller | none | context limits, output reservation, per-model limits (M4) |
+| 11 | Relevance/dependency retriever | doc TF-IDF only | cross-store retrieval (M5) |
+| 12 | Token Budget Controller | `TokenBudget` + `context_window_for` (M4) | done (operator override via `--context-window`) |
 | 13 | CDM normalization | production | explicit L0–L4 levels + policy engine (`tokan/policy.py`, M3) |
 | 14 | Exact cache | production | scope keys lack tenant; key includes only model/temp/top_p/user (M2 scope work) |
-| 15 | Prefix-cache optimizer | `--prompt-cache-key` + stable ordering | formal prompt-ordering module (M4) |
-| 16 | Semantic cache | `semantic_digest` (ngram) unused for answers | conservative answer reuse w/ risk threshold (M4) |
+| 15 | Prefix-cache optimizer | `--prompt-cache-key` + stable ordering + session measurement | formal prompt-ordering module (deferred; measurement honest in `session.py`) |
+| 16 | Semantic cache | `SemanticAnswerCache` (M4, opt-in conservative) | done (factual-only, model-scoped, 0.97 threshold, TTL+LRU) |
 | 17 | Intermediate-artifact cache | none | summaries/embeddings/index caches (M3–M5) |
 | 18 | JeV decision engine | binary local/llm | multi-route policy + tiers (M6) |
 | 19 | Deterministic executors | line_lookup only | executor plugin API + suite (M6) |
 | 20 | Model router | single `--fallback-model` retry | capability tiers, chains, budget (M6) |
-| 21 | Prompt assembler | inline per-protocol | governor-driven assembly (M4) |
+| 21 | Prompt assembler | inline per-protocol + governor-driven `messages` shedding (M4) | gemini/responses governor assembly (M6) |
 | 22 | Quality gate | — | pre/post deterministic checks (M6) |
 | 23 | Progressive fallback | — | context expansion loop (M6) |
 | 24 | Memory update pipeline | cache fill only | M1 begins it (events); responses wired M2 |
-| 25 | Optimization receipts | receipts + headers | manifest evidence ledger (M1 skeleton) |
+| 25 | Optimization receipts | receipts + headers + `ContextManifest` ledger (M1/M4) | done |
 | 26 | Metrics/tracing/eval | metrics + dashboard + benchmark scripts | OTel, locked counters, CI eval harness (M2–M6) |
 
 ## 3. Phased plan
@@ -104,10 +105,23 @@ Small, independently testable milestones. Each lands with tests + measurements.
   long-line elision, no truncation); only NORMAL/LOW content reaches L3. The
   cache digest is provably policy-independent (asserted for all four
   protocols), so adopting the policy can never change a cache key.
-- **M4: Context Governor + Token Budget Controller** — per-model context limits,
-  output reservation, utility-per-token selection over required/high-value/
-  optional/redundant classes; progressive expansion loop; conservative semantic
-  answer cache with risk threshold.
+- **M4 (done): Context Governor + Token Budget Controller** — `tokan/governor.py`:
+  per-model context windows (`context_window_for`, longest family-prefix match,
+  operator override via `--context-window`), output reservation, and
+  utility-class selection (REQUIRED/HIGH_VALUE/OPTIONAL/REDUNDANT) that sheds
+  only when a request would overflow its window. Under budget the governor is
+  pure measurement (`applied=False`, bytes + cache key untouched); over budget
+  it sheds redundant → optional → high-value, never the system/developer
+  instructions, tool exchanges (atomic unit) or the newest user ask; if the
+  required context alone overflows it fails open (forward everything, flag
+  `overflow`). Shedding binds to the `messages` wire (chat/anthropic); gemini
+  and responses measure only and never claim bytes changed. The digest is
+  computed before the plan, so shedding can never change a cache key
+  (asserted for all four protocols). Conservative semantic answer cache:
+  opt-in `--semantic-cache`, factual-only, model-scoped, high risk threshold,
+  TTL+LRU; semantic hits route as `semantic`, not `cache`, so the digest
+  cache's hit rate stays honest. Measured overhead: +156µs on a 52-message
+  conversation (~3µs/message), +30µs on a 10-turn; semantic probe 15µs.
 - **M5: Repository + document intelligence v2** — incremental symbol index,
   dependency/test relationships, evidence-unit retrieval; doc coverage detection.
 - **M6: Quality gate + routing + production hardening** — pre/post-call
@@ -220,9 +234,12 @@ compatibility). Receipts carry a request `rid` unconditionally since M2
    compatibility.
 5. **Original bytes in the store** — the digest-scope scrubbing (devolatilization)
    is for cache keys only; the canonical history must remain lossless.
-6. **Semantic answer cache stays off (unchanged from earlier decision)** — when
-   M4 lands it will be conservative (high threshold, task-class and
-   revision match), per the cache-safety rules.
+6. **Semantic answer cache is conservative-when-on (updated in M4)** — landed
+   as designed: opt-in (`--semantic-cache`, default off), high risk threshold
+   (0.97), factual-only task-class gate (edits/file paths/code excluded),
+   model-scoped (an answer from one model is never served for another), TTL +
+   LRU bounded, memory-only. Semantic hits get their own `semantic` route so
+   the digest cache's hit rate stays honest, per the cache-safety rules.
 
 ## 6. Security threat model (summary)
 
