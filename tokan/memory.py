@@ -454,6 +454,9 @@ class ContextManifest:
     included: Dict[str, int] = field(default_factory=dict)
     compressed: Dict[str, int] = field(default_factory=dict)
     omitted: List[str] = field(default_factory=list)
+    #: Canonical-model view of the request (messages/tools/parts/extension
+    #: counts) — filled once the canonical parser is wired into the observer.
+    canonical: Dict[str, int] = field(default_factory=dict)
     policy: Dict[str, Any] = field(
         default_factory=lambda: {"version": POLICY_VERSION, "levels": ["L1", "L2"]}
     )
@@ -478,6 +481,7 @@ class ContextManifest:
             "included": dict(self.included),
             "compressed": dict(self.compressed),
             "omitted": list(self.omitted),
+            "canonical": dict(self.canonical),
             "policy": dict(self.policy),
             "risk": self.risk,
         }

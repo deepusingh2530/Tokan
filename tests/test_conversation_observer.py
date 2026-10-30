@@ -1,13 +1,15 @@
 """Observe-only conversation memory, end to end through the gateway.
 
-Parity contract: with ``--conversation-db`` the wire behavior (response body,
-status, ``X-Optimizer-*`` headers, receipt fields other than the added ``rid``)
-is identical to running without it. The store records; it never serves.
+Parity contract: with or without ``--conversation-db`` the wire behavior
+(response body, status, ``X-Optimizer-*`` headers, receipt shape including
+the unconditional M2 ``rid``) is identical. The store records; it never
+serves.
 """
 import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -73,7 +75,6 @@ def _wait_messages(db_path, conversation, minimum, timeout=5.0):
     """The observer runs just after the response is flushed, so reading the
     store immediately can race it — poll until ``minimum`` message events are
     visible (or fail)."""
-    import time
     deadline = time.time() + timeout
     while time.time() < deadline:
         store = ConversationStore(db_path)
@@ -159,18 +160,20 @@ class TestConversationObserver(unittest.TestCase):
         self.assertTrue(any("never touch CI files" in c for c in state.constraints))
 
     def test_parity_with_store_disabled(self):
-        # Identical requests through a store-less gateway: no rid, same shape.
+        # Identical requests through a store-less gateway: same bodies/headers;
+        # receipts carry `rid` since M2 (unconditional, additive key) but no
+        # conversation events are stored anywhere.
         proxy = self._start_gateway()
         origin = f"http://127.0.0.1:{proxy.port}"
         messages = [{"role": "user", "content": "parity check payload"}]
-        _, headers, body = _chat(origin, messages, session="parity")
-        self.assertNotIn("X-Optimizer-Session-Id", headers)
+        status, headers, body = _chat(origin, messages, session="parity")
+        self.assertEqual(status, 200)
         receipt_rows = json.loads(
             urllib.request.urlopen(f"{origin}/receipts", timeout=5).read()
         )["receipts"]
-        self.assertNotIn("rid", receipt_rows[-1])
+        self.assertIn("rid", receipt_rows[-1])
 
-    def test_rid_present_only_with_store(self):
+    def test_rid_present_and_manifest_has_canonical_stats(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         proxy = self._start_gateway(conversation_db=os.path.join(tmp.name, "conv.db"))
@@ -180,6 +183,22 @@ class TestConversationObserver(unittest.TestCase):
             urllib.request.urlopen(f"{origin}/receipts", timeout=5).read()
         )["receipts"]
         self.assertIn("rid", receipt_rows[-1])
+        # M2: manifests carry the canonical-model view of the request.
+        db = os.path.join(tmp.name, "conv.db")
+        deadline = time.time() + 5
+        stats = {}
+        while time.time() < deadline:
+            store = ConversationStore(db)
+            try:
+                manifests = [e for e in store.events("rid-conv") if e.kind == "manifest"]
+            finally:
+                store.close()
+            if manifests:
+                stats = manifests[-1].content.get("canonical", {})
+                break
+            time.sleep(0.05)
+        self.assertEqual(stats.get("messages"), 1)
+        self.assertEqual(stats.get("tools"), 0)
 
     def test_verbatim_resend_records_no_duplicate(self):
         tmp = tempfile.TemporaryDirectory()
