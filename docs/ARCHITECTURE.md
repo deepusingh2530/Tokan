@@ -48,7 +48,7 @@ Numbering follows the target module list in the master plan.
 | 1 | Protocol adapters | interceptor path-dispatch + `prepare()` | no canonical model; per-protocol ad-hoc projection; no reconstruction guarantee |
 | 2 | Auth/scope guard | — | no inbound auth, no tenant/user scope (M6) |
 | 3 | Canonical request model | `tokan/canonical.py` (M2) | pipeline adoption in M3 (governor consumes `fingerprint_view`) |
-| 4 | Content classifier | heuristics inside CDM | no typed content classes/authority/fidelity (M3) |
+| 4 | Content classifier | `tokan/policy.py` (M3) | typed classes + authority tiers; user/system capped L1 |
 | 5 | Secret protector | none | secret detection/redaction (M6) |
 | 6 | Conversation store | — | **M1 (this milestone)** |
 | 7 | Conversation state extractor | — | **M1 (deterministic subset)** |
@@ -57,7 +57,7 @@ Numbering follows the target module list in the master plan.
 | 10 | Document intelligence | doc.py TF-IDF | semantic retrieval, coverage detection (M5) |
 | 11 | Relevance/dependency retriever | doc TF-IDF only | cross-store retrieval (M4–M5) |
 | 12 | Token Budget Controller | none | context limits, output reservation, per-model limits (M4) |
-| 13 | CDM normalization | production | explicit L0–L4 levels + policy engine (M3) |
+| 13 | CDM normalization | production | explicit L0–L4 levels + policy engine (`tokan/policy.py`, M3) |
 | 14 | Exact cache | production | scope keys lack tenant; key includes only model/temp/top_p/user (M2 scope work) |
 | 15 | Prefix-cache optimizer | `--prompt-cache-key` + stable ordering | formal prompt-ordering module (M4) |
 | 16 | Semantic cache | `semantic_digest` (ngram) unused for answers | conservative answer reuse w/ risk threshold (M4) |
@@ -95,9 +95,15 @@ Small, independently testable milestones. Each lands with tests + measurements.
   recording assistant responses on streaming paths too. (Done — streaming
   responses were already recorded in M1; M2 added the canonical model,
   unconditional rid, and counter locking.)
-- **M3: Content classification + compression policy engine** — explicit L0–L4
-  compression levels bound to content classes; authority protection
-  (system/developer/tool schemas never above L1).
+- **M3 (done): Content classification + compression policy engine** —
+  `tokan/policy.py`: `ContentClass`/`Authority`/`CompressionLevel` (explicit
+  L0–L4), deterministic `classify()`, and a `CompressionPolicy` bound into the
+  wire-forward choke points. Authority protection enforced at the mechanism:
+  system/developer instructions, tool schemas and the user's own constraints
+  cap at **L1 lossless** (ANSI/whitespace only — no diff compaction, no
+  long-line elision, no truncation); only NORMAL/LOW content reaches L3. The
+  cache digest is provably policy-independent (asserted for all four
+  protocols), so adopting the policy can never change a cache key.
 - **M4: Context Governor + Token Budget Controller** — per-model context limits,
   output reservation, utility-per-token selection over required/high-value/
   optional/redundant classes; progressive expansion loop; conservative semantic
