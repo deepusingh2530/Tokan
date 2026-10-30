@@ -112,6 +112,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         fallback_model=getattr(args, "fallback_model", None),
         log_requests=getattr(args, "log_requests", False),
         prompt_cache_key=getattr(args, "prompt_cache_key", False),
+        conversation_db=getattr(args, "conversation_db", None),
     )
     proxy = TokenOptimizerProxy(config, pipeline).start()
     gw = _gateway_info(args)
@@ -267,6 +268,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="inject a stable prompt_cache_key (session id) into OpenAI-wire "
                             "payloads so the provider routes the conversation to one prompt "
                             "cache (support varies by provider; off by default)")
+        p.add_argument("--conversation-db", default=None,
+                       help="sqlite file for the append-only conversation store "
+                            "(observe-only memory: records events + manifests, never serves them)")
 
     p_serve = sub.add_parser("serve", help="run the optimization gateway")
     add_gateway_flags(p_serve)
