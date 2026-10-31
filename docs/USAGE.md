@@ -295,6 +295,12 @@ Key ideas:
 | `--log-requests` | off | Print one **receipt line** per request to the console. |
 | `--prompt-cache-key` | off | Inject a stable `prompt_cache_key` (the session id) into OpenAI-wire payloads so the provider routes the conversation to one prompt cache. Provider support varies; off by default. |
 | `--conversation-db PATH` | — | SQLite file for the **append-only conversation store** (observe-only memory: records message events + context manifests per turn, never serves them). Storage failures fail open — the gateway serves on regardless. |
+| `--governor` | off | **Context Governor**: when a request would overflow the model's context window, shed low-value context (oldest optional turns first — never system/developer instructions, tool exchanges or your latest ask) instead of forwarding a payload the provider would reject with a 400. Under budget it measures only and touches nothing. Off by default. |
+| `--context-window N` | model table | Override the built-in per-model context window (tokens). Set this when your deployment's real limit differs from the table. |
+| `--output-reserve N` | `4096` | Completion tokens to reserve before admitting input (a request's own `max_tokens` wins per request). |
+| `--recent-window N` | `6` | Trailing messages treated as the high-value working set the governor protects longest. |
+| `--semantic-cache` | off | **Semantic answer cache**: reuse a near-identical previous answer for self-contained factual questions (paraphrases of "What is CI?"). Conservative + opt-in: edits, file paths, code and imperatives are never cached; answers are scoped per model. Semantic hits are booked as `semantic`, not `cache`, so the exact cache's hit rate stays honest. |
+| `--semantic-threshold 0.97` | `0.97` | Risk threshold for semantic reuse (0.97 = near-paraphrase only). Raise it to be more conservative, lower it with care. |
 
 ### Provider recipes
 
@@ -675,6 +681,23 @@ These are deliberately **not** mixed into `tokens_saved`: compaction savings
 and retrieval avoidance have different baselines, and one number per baseline
 is what stays defensible. Provider prompt-cache discounts remain the
 provider's, surfaced only.
+
+### Context Governor — budget sheds (`--governor`)
+
+When the governor is on, budget decisions are booked in their **own counters**
+(`/metrics`, `stats`, dashboard **Governor sheds / Shed tokens / Overflows**
+tiles):
+
+| Field | Meaning |
+|---|---|
+| `governor_sheds` | requests where context was shed to fit the model's window |
+| `governor_shed_tokens` | estimated tokens withheld from the provider |
+| `governor_overflows` | requests whose *required* context alone exceeded the window (forwarded unchanged — the provider decides) |
+
+Shed tokens are an **estimate** of what we withheld and are deliberately
+**not** counted in `tokens_saved` — shedding is risk, not provenance: we can't
+claim the provider would have accepted the un-shed payload. The receipt and
+manifest carry the full plan (window, reserve, kept/shed indices) for audit.
 
 ### What `tokens_saved` is measured on
 
