@@ -301,6 +301,12 @@ Key ideas:
 | `--recent-window N` | `6` | Trailing messages treated as the high-value working set the governor protects longest. |
 | `--semantic-cache` | off | **Semantic answer cache**: reuse a near-identical previous answer for self-contained factual questions (paraphrases of "What is CI?"). Conservative + opt-in: edits, file paths, code and imperatives are never cached; answers are scoped per model. Semantic hits are booked as `semantic`, not `cache`, so the exact cache's hit rate stays honest. |
 | `--semantic-threshold 0.97` | `0.97` | Risk threshold for semantic reuse (0.97 = near-paraphrase only). Raise it to be more conservative, lower it with care. |
+| `--api-keys K1,K2` | *(env `TOKAN_API_KEYS`)* | **Inbound auth (M6).** Comma-separated gateway keys. Clients send one as `Authorization: Bearer <key>` **or** `X-Optimizer-Api-Key: <key>` (either is accepted — a BYOK provider credential in `Authorization` is just one candidate, so it can coexist with the real key). Constant-time comparison; `/healthz` stays open for probes; everything else — dashboard and `/metrics` included — 401s without a key. Empty = no inbound auth, which is fine on the default loopback bind. |
+| `--allow-insecure` | off | Acknowledge binding a **non-loopback** host with no keys. Without it (or without `--api-keys`) `serve` refuses to start on e.g. `0.0.0.0` — an open gateway would spend your provider budget and see every prompt. |
+| `--redact-secrets` | off | Replace detected secrets (AWS/GitHub/OpenAI/Anthropic/Google/Slack/Stripe/npm keys, JWTs, private-key blocks — *documented formats only*, no entropy guessing) with `[REDACTED:<type>]` **before** canonicalization, the cache digest and the upstream call. Off = detect-and-disclose: bytes untouched, but findings are reported on receipts (`secrets_detected`), `X-Optimizer-Secrets-*` metrics, the console and the dashboard. Redaction is deterministic: two payloads differing only in secret material share one digest, so cache keys never encode secrets. |
+| `--doc-fallback-full` | off | **Quality gate (M6).** When a doc question scores below the coverage threshold (the document likely cannot answer it), send the **full document** instead of weak excerpts — spends the naive tokens on purpose to protect answer quality. Disclosed as `doc_fallback: "full_doc"` on the receipt and `optimizer` block; counted in `doc_full_fallbacks`. Compaction still applies, so some savings remain, but this ask saves far less than retrieval would. |
+| `--task-router` | off | Classify each request into a routing tier (`tier_0` local / `tier_1` low-cost / `tier_2` frontier) and disclose it: receipt `tier`, `/metrics` → `tiers` + `router_requests`. **Classify-only by default** — no model is ever rewritten on its own. |
+| `--tier1-model MODEL` | — | Opt-in rewrite: `tier_1` requests (formatting, quick fixes) are sent to `MODEL` (e.g. `gpt-4o-mini`). Never defaulted — rewriting the model an agent asked for would break BYOK/plan-gated flows. |
 
 ### Provider recipes
 
@@ -644,7 +650,9 @@ An auto-refreshing HTML page showing:
 
 - **Counters:** requests, cache hits, local solves, LLM calls, tokens saved,
   saved %, provider cache, prefix reuse, **Docs / Doc Q&A / Doc avoided**,
-  fallbacks, cache entries, hit rate.
+  fallbacks, cache entries, hit rate; and the M6 tiles **Full-doc fallbacks**,
+  **Secrets found / redacted** and **Auth failures** (all read live from
+  `/metrics`, zero hardcoded values).
 - **A rolling table of recent requests:** time, route, model, tokens in→out,
   saved % (rows from `/v1/doc/ask` carry a `doc` marker — their savings are
   measured against the full-document resend), status, **latency (tokan /
@@ -667,7 +675,13 @@ is Tokan's.
 
 ### Metrics — `http://127.0.0.1:4040/metrics`
 
-Machine-readable JSON (`session` + `cache` counters). Use this for monitoring.
+Machine-readable JSON (`session` + `cache` counters, plus `tiers` from the
+task router). Use this for monitoring.
+
+M6 hardening counters in `session`: `auth_failures` (401s), `secrets_detected`
+/ `secrets_redacted`, `doc_full_fallbacks`, `router_requests` (and the
+per-tier breakdown under the top-level `tiers` key). With inbound auth
+enabled this endpoint itself requires a key.
 
 ### `stats` command
 

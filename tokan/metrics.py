@@ -49,6 +49,13 @@ class SessionMetrics:
         self.doc_low_coverage = 0        # doc Q&As whose question outran the document (M5)
         self.evidence_searches = 0       # /v1/evidence + MCP evidence calls (M5)
         self.evidence_units = 0          # evidence units returned across those searches
+        # M6 hardening: inbound auth posture, secret hygiene, quality gate.
+        self.auth_failures = 0           # requests rejected by inbound auth
+        self.secrets_detected = 0        # credential-shaped spans seen in payloads
+        self.secrets_redacted = 0        # ... of which replaced before leaving the box
+        self.doc_full_fallbacks = 0      # low-coverage asks sent the full doc (quality gate)
+        self.router_requests = 0         # requests tier-classified (--task-router)
+        self.tiers: Dict[str, int] = {}  # per-tier counts (tier_0/tier_1/tier_2/unknown)
 
     def record(self, route: str, original_tokens: int, optimized_tokens: int = 0) -> None:
         with self._lock:
@@ -131,6 +138,7 @@ class SessionMetrics:
         sent_tokens: int,
         chunks_used: int = 0,
         low_coverage: bool = False,
+        full_fallback: bool = False,
     ) -> None:
         """Book one document Q&A request against its naive full-resend baseline.
 
@@ -138,7 +146,9 @@ class SessionMetrics:
         retrieval avoidance have different baselines and mixing them would
         make both numbers harder to defend. ``low_coverage`` (M5) counts the
         asks whose question outran the document — a quality signal, not a
-        saving.
+        saving. ``full_fallback`` (M6) counts the asks that spent the naive
+        full-document cost on purpose because retrieval was too weak
+        (``--doc-fallback-full``) — a deliberate quality-over-spend choice.
         """
         with self._lock:
             self.doc_questions += 1
@@ -147,12 +157,33 @@ class SessionMetrics:
             self.doc_chunks_used += max(0, int(chunks_used))
             if low_coverage:
                 self.doc_low_coverage += 1
+            if full_fallback:
+                self.doc_full_fallbacks += 1
 
     def record_evidence(self, units: int) -> None:
         """One evidence search was served, returning ``units`` ranked units."""
         with self._lock:
             self.evidence_searches += 1
             self.evidence_units += max(0, int(units))
+
+    # ------------------------------------------------------- M6 hardening
+    def record_auth_failure(self) -> None:
+        """A request was rejected by inbound authentication (401)."""
+        with self._lock:
+            self.auth_failures += 1
+
+    def record_secrets(self, *, detected: int, redacted: int = 0) -> None:
+        """Credential-shaped spans seen (and, if redacting, replaced)."""
+        with self._lock:
+            self.secrets_detected += max(0, int(detected))
+            self.secrets_redacted += max(0, int(redacted))
+
+    def record_tier(self, tier: str) -> None:
+        """One request was classified by the Adaptive Task Router."""
+        with self._lock:
+            self.router_requests += 1
+            key = str(tier)
+            self.tiers[key] = self.tiers.get(key, 0) + 1
 
     @property
     def doc_tokens_avoided(self) -> int:
@@ -236,6 +267,11 @@ class SessionMetrics:
                 "doc_low_coverage": self.doc_low_coverage,
                 "evidence_searches": self.evidence_searches,
                 "evidence_units": self.evidence_units,
+                "auth_failures": self.auth_failures,
+                "secrets_detected": self.secrets_detected,
+                "secrets_redacted": self.secrets_redacted,
+                "doc_full_fallbacks": self.doc_full_fallbacks,
+                "router_requests": self.router_requests,
             }
 
     def reset(self) -> None:
@@ -263,3 +299,9 @@ class SessionMetrics:
             self.doc_low_coverage = 0
             self.evidence_searches = 0
             self.evidence_units = 0
+            self.auth_failures = 0
+            self.secrets_detected = 0
+            self.secrets_redacted = 0
+            self.doc_full_fallbacks = 0
+            self.router_requests = 0
+            self.tiers = {}

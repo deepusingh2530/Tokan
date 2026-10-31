@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import html
 import json
 import threading
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -165,9 +167,60 @@ class ProxyConfig:
     #: Optional SQLite file for the append-only conversation store
     #: (observe-only memory: records events + manifests, never serves them).
     conversation_db: Optional[str] = None
+    # ----------------------------------------------------------- M6 hardening
+    #: Accepted inbound API keys (empty = no inbound auth, loopback-only by
+    #: default binding). Clients present one as ``Authorization: Bearer <key>``
+    #: or ``X-Optimizer-Api-Key: <key>``; comparisons are constant-time.
+    api_keys: Tuple[str, ...] = ()
+    #: Replace detected secrets with ``[REDACTED:<type>]`` before anything
+    #: leaves the machine (see tokan/secret.py). Off = detect-and-disclose.
+    redact_secrets: bool = False
+    #: Quality gate: when a doc question scores below the coverage threshold,
+    #: send the FULL document instead of weak excerpts (spends naive tokens on
+    #: purpose to protect answer quality). Off = excerpts + caveat only.
+    doc_fallback_full: bool = False
+    #: Classify each request into a routing tier (Adaptive Task Router) and
+    #: disclose it on receipts/headers. Model rewriting stays operator-driven.
+    task_router: bool = False
+    #: Explicit opt-in for Tier-1 model rewrites (never defaulted: rewriting
+    #: the model an agent asked for breaks BYOK/plan-gated flows unless the
+    #: operator owns both ends).
+    tier1_model: Optional[str] = None
     # Context Governor and semantic answer cache (M4) live on the pipeline
     # (see tokan/cli.py::_build_pipeline) — they act inside prepare(), not at
     # the wire, so the config stays a transport concern only.
+
+
+#: Hosts that need no inbound auth (the OS loopback interface only).
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+#: Line width for full-document fallback sends. The CDM normalizer elides any
+#: single line over ~2000 chars (minified-bundle protection), so the whole
+#: document is wrapped first — otherwise a one-line document arrives
+#: truncated, which is the one thing --doc-fallback-full promises not to do.
+_FULL_DOC_LINE_CHARS = 1000
+
+
+def ensure_bind_safety(
+    host: str, api_keys: Sequence[str], *, allow_insecure: bool = False
+) -> None:
+    """Fail closed: a non-loopback bind needs inbound auth (M6).
+
+    Exposing an unauthenticated gateway to a network is the gateway's top
+    threat-model item: anyone who can reach it can spend the operator's
+    provider budget and read whatever context passes through. Binding off
+    loopback without keys therefore refuses to start unless the operator
+    explicitly acknowledges with ``allow_insecure``.
+    """
+    if allow_insecure or api_keys:
+        return
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
+        return
+    raise SystemExit(
+        f"refusing to bind non-loopback host {host!r} without inbound auth: "
+        "set --api-keys (or TOKAN_API_KEYS), or pass --allow-insecure to "
+        "acknowledge an open bind"
+    )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -179,9 +232,66 @@ class _Handler(BaseHTTPRequestHandler):
     # Rolling per-request receipts (deque shared across handler instances);
     # None disables recording (direct-handler tests).
     receipts: Optional[Deque[Dict[str, Any]]] = None
+    # Adaptive Task Router (M6); None unless --task-router is configured.
+    _task_router: Optional[Any] = None
 
     def log_message(self, fmt: str, *args: Any) -> None:  # silence default stderr spam
         pass
+
+    # ------------------------------------------------------------------ auth
+    def _check_auth(self) -> bool:
+        """M6 inbound auth: enforce ``--api-keys`` when configured.
+
+        ``/healthz`` stays open (liveness probes must work unauthenticated);
+        every other path — including the dashboard and metrics, which leak
+        operational detail — requires a configured key, presented as
+        ``Authorization: Bearer <key>`` (also the credential-passthrough
+        shape, so a Copilot OAuth token can double as the gateway key) or
+        ``X-Optimizer-Api-Key: <key>``. Comparison is constant-time; the
+        presented key is never echoed. With no keys configured this is a
+        no-op — the loopback-only default (or ``ensure_bind_safety``) covers
+        that posture.
+        """
+        keys = self.config.api_keys
+        if not keys:
+            return True
+        if self.path in ("/healthz", "/health"):
+            return True
+        # Two candidate credentials: the bearer (which may legitimately be a
+        # passthrough *provider* credential in BYOK flows — Copilot OAuth
+        # tokens, OpenAI keys — so it is only one candidate, never the sole
+        # option) and the purpose-built X-Optimizer-Api-Key. Either matching
+        # a configured key admits the request.
+        presented = (self.headers.get("Authorization") or "").strip()
+        candidates = []
+        if presented.lower().startswith("bearer ") and presented[7:].strip():
+            candidates.append(presented[7:].strip())
+        optimizer_key = (self.headers.get("X-Optimizer-Api-Key") or "").strip()
+        if optimizer_key:
+            candidates.append(optimizer_key)
+        ok = False
+        for candidate in candidates:
+            for key in keys:
+                if hmac.compare_digest(candidate.encode("utf-8"), key.encode("utf-8")):
+                    ok = True
+        if not ok:
+            self.pipeline.metrics.record_auth_failure()
+            if self.config.log_requests:
+                print(
+                    f"{time.strftime('%H:%M:%S')} {self.path} 401 unauthorized",
+                    flush=True,
+                )
+            self._send_json(
+                401,
+                {"error": {
+                    "message": "unauthorized: send 'Authorization: Bearer <key>' "
+                               "or 'X-Optimizer-Api-Key: <key>' (gateway keys "
+                               "come from --api-keys / TOKAN_API_KEYS)",
+                    "type": "authentication_error",
+                }},
+                extra={"WWW-Authenticate": "Bearer"},
+            )
+        return ok
 
     # -------------------------------------------------------------- plumbing
     def _send_json(self, status: int, payload: Dict[str, Any], *, extra: Optional[Dict[str, str]] = None) -> None:
@@ -194,13 +304,18 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _route_headers(self, result: PipelineResult) -> Dict[str, str]:
+    def _route_headers(
+        self, result: PipelineResult, *, secrets_redacted: int = 0
+    ) -> Dict[str, str]:
         out = {
             "X-Optimizer-Route": result.decision.route,
             "X-Optimizer-Saved-Tokens": str(result.record.saved_tokens),
             "X-Optimizer-Saved-Percent": str(result.record.saved_pct),
             "X-Optimizer-Digest": result.record.digest[:16],
         }
+        # M6: tell the client when secrets were replaced before forwarding.
+        if secrets_redacted:
+            out["X-Optimizer-Secrets-Redacted"] = str(secrets_redacted)
         # Doc Governor: disclose the retrieval economics on every response
         # (including streams, whose body is SSE chunks we don't rewrite).
         ds = result.doc_savings
@@ -226,6 +341,9 @@ class _Handler(BaseHTTPRequestHandler):
         fallback: str = "",
         protocol: str = "openai",
         response_text: str = "",
+        tier: str = "",
+        secrets_detected: int = 0,
+        secrets_redacted: int = 0,
     ) -> None:
         """One line of truth per request: route, tokens, latency, disclosures.
 
@@ -279,6 +397,16 @@ class _Handler(BaseHTTPRequestHandler):
         if ds and ds.get("coverage") is not None:
             rec["coverage"] = ds["coverage"]
             rec["low_coverage"] = bool(ds.get("low_coverage", False))
+        # M6 disclosures — additive too: requests with no secrets, no
+        # fallback and no router run produce byte-identical receipts.
+        if ds and ds.get("fallback"):
+            rec["doc_fallback"] = ds["fallback"]
+        if tier:
+            rec["tier"] = tier
+        if secrets_detected:
+            rec["secrets_detected"] = secrets_detected
+        if secrets_redacted:
+            rec["secrets_redacted"] = secrets_redacted
         # Context Governor (M4): budget decision, only when the governor ran.
         # Additive keys — a governor-off receipt is byte-identical to M3's.
         plan = result.governor_plan
@@ -313,6 +441,15 @@ class _Handler(BaseHTTPRequestHandler):
                     line += f" coverage={ds.get('coverage', 0)}(LOW)"  # M5 quality flag
                 elif ds.get("coverage") is not None:
                     line += f" coverage={ds['coverage']}"
+                if ds.get("fallback"):
+                    line += f" doc_fallback={ds['fallback']}"  # M6 quality gate
+            if rec.get("tier"):
+                line += f" tier={rec['tier']}"  # M6 routing disclosure
+            if rec.get("secrets_detected"):
+                line += (
+                    f" secrets={rec['secrets_detected']}"
+                    + (f"(redacted {rec['secrets_redacted']})" if rec.get("secrets_redacted") else "")
+                )
             if upstream_cached:
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
@@ -482,6 +619,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------------- routes
     def do_GET(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
         if self.path in ("/healthz", "/health"):
             self._send_json(200, {"ok": True, "service": "token-optimizer"})
         elif self.path in ("/models", "/v1/models"):
@@ -493,6 +632,9 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "session": self.pipeline.metrics.as_dict(),
                     "cache": self.pipeline.cache.stats(),
+                    # M6 routing: per-tier classification counts (populated
+                    # only when --task-router is on; empty otherwise).
+                    "tiers": self.pipeline.metrics.tiers,
                 },
             )
         elif self.path in ("/receipts", "/v1/receipts"):
@@ -579,6 +721,10 @@ class _Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">Doc avoided</div><div class="v" title="Tokens never sent because retrieval replaced the full-document resend (baseline = whole doc + question)">{esc(m.get('doc_tokens_avoided', 0))}</div></div>
  <div class="card"><div class="k">Low coverage</div><div class="v" title="Doc Q&As whose question outran the document's vocabulary — the answer may not be supported (M5)">{esc(m.get('doc_low_coverage', 0))}</div></div>
  <div class="card"><div class="k">Evidence</div><div class="v" title="Ranked evidence searches served across ingested documents (M5)">{esc(m.get('evidence_searches', 0))}</div></div>
+ <div class="card"><div class="k">Full-doc fallbacks</div><div class="v" title="Low-coverage doc asks sent the full document on purpose — quality protected, tokens spent (M6)">{esc(m.get('doc_full_fallbacks', 0))}</div></div>
+ <div class="card"><div class="k">Secrets found</div><div class="v" title="Credential-shaped spans detected in request payloads (M6)">{esc(m.get('secrets_detected', 0))}</div></div>
+ <div class="card"><div class="k">Secrets redacted</div><div class="v" title="Secrets replaced before leaving the machine (--redact-secrets; M6)">{esc(m.get('secrets_redacted', 0))}</div></div>
+ <div class="card"><div class="k">Auth failures</div><div class="v" title="Requests rejected for missing/invalid API keys (M6)">{esc(m.get('auth_failures', 0))}</div></div>
  <div class="card"><div class="k">Fallbacks</div><div class="v">{esc(m['fallbacks'])}</div></div>
  <div class="card"><div class="k">Cache entries</div><div class="v">{esc(c['entries'])}</div></div>
  <div class="card"><div class="k">Hit rate</div><div class="v">{esc(c['hit_rate'])}</div></div>
@@ -596,6 +742,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
         protocol, endpoint = self._classify(self.path)
         # Doc Governor extensions are Tokan's own endpoints, not provider
         # wires — recognized before the protocol classifier 404s them.
@@ -612,6 +760,28 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError):
             self._send_json(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
             return
+
+        # M6 secret posture: every payload (chat, doc-ask, ingest, evidence)
+        # is scanned. Default = detect-and-disclose (bytes untouched);
+        # --redact-secrets replaces each finding with a typed placeholder
+        # before anything leaves — before canonicalization, the cache digest
+        # and the upstream call, so no secret can enter any stored artifact.
+        secrets_detected = 0
+        secrets_redacted = 0
+        if self.config.redact_secrets:
+            from ..secret import redact_payload
+
+            payload, redacted = redact_payload(payload)
+            secrets_redacted = sum(redacted.values())
+            secrets_detected = secrets_redacted
+        else:
+            from ..secret import count_payload_secrets
+
+            secrets_detected = sum(count_payload_secrets(payload).values())
+        if secrets_detected:
+            self.pipeline.metrics.record_secrets(
+                detected=secrets_detected, redacted=secrets_redacted
+            )
 
         if is_ingest:
             self._handle_ingest(payload)
@@ -630,6 +800,17 @@ class _Handler(BaseHTTPRequestHandler):
             # Retrieval produces a standard OpenAI-wire prompt; everything
             # downstream (cache, receipts, fallback, session) just runs.
             protocol, endpoint = "openai", "chat"
+
+        # M6 routing (opt-in): classify the request into a complexity tier
+        # and disclose it. Model rewriting happens ONLY when the operator
+        # explicitly set --tier1-model — never by default: rewriting the
+        # model an agent asked for breaks BYOK/plan-gated flows.
+        tier = ""
+        if self.config.task_router and self._task_router is not None:
+            tier = self._task_router.get_tier(payload.get("messages") or [], payload=payload)
+            self.pipeline.metrics.record_tier(tier)
+            if self.config.tier1_model and tier == "tier_1":
+                payload = self._task_router.rewrite_payload(payload, tier)
 
         if endpoint == "count_tokens":
             # Anthropic bookkeeping endpoint — answer locally, zero tokens.
@@ -689,6 +870,9 @@ class _Handler(BaseHTTPRequestHandler):
                     ms=(time.perf_counter() - started) * 1000,
                     upstream_ms=0.0,
                     protocol=protocol,
+                    tier=tier,
+                    secrets_detected=secrets_detected,
+                    secrets_redacted=secrets_redacted,
                     response_text=(
                         result.local_answer
                         or (result.cached_value if isinstance(result.cached_value, str) else "")
@@ -710,18 +894,27 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000,
                 upstream_ms=0.0,
                 protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
                 response_text=(
                     result.local_answer
                     or (result.cached_value if isinstance(result.cached_value, str) else "")
                 ),
             )
-            self._send_json(200, response, extra=self._route_headers(result))
+            self._send_json(
+                200, response,
+                extra=self._route_headers(result, secrets_redacted=secrets_redacted),
+            )
             return
 
         # 2) Forward compacted payload upstream.
         self._forward(
             payload, result, protocol=protocol, endpoint=endpoint,
             started=started,
+            tier=tier,
+            secrets_detected=secrets_detected,
+            secrets_redacted=secrets_redacted,
         )
 
     @staticmethod
@@ -904,6 +1097,28 @@ class _Handler(BaseHTTPRequestHandler):
         messages, idxs, chunks = assemble_messages(doc, question, top_k=top_k)
         coverage = round(doc.coverage(question), 3)  # M5: O(question), no retrieval
         low_coverage = coverage < LOW_COVERAGE
+        full_fallback = False
+        if low_coverage and self.config.doc_fallback_full:
+            # M6 quality gate: retrieval is demonstrably weak for this
+            # question (its vocabulary barely appears in the document), so
+            # spend the naive full-document tokens rather than risk an
+            # answer the excerpts cannot support. The system instruction
+            # keeps its abstention caveat — honest even with everything
+            # attached: if the document truly cannot answer, the model says
+            # so instead of inventing. Accounting stays honest too: this ask
+            # saves ~nothing; that is the price of the guarantee.
+            #
+            # Wrap before sending (same reason as summarize()): the CDM
+            # normalizer elides any single line longer than ~2k chars, and a
+            # one-line document would otherwise arrive *truncated* — the one
+            # thing this flag promises not to do. Wrapping is whitespace only.
+            full_text = textwrap.fill(doc.text, width=_FULL_DOC_LINE_CHARS)
+            messages = [
+                messages[0],
+                {"role": "user", "content": f"{full_text}\n\nQuestion: {question}"},
+            ]
+            idxs, chunks = [], []
+            full_fallback = True
         assembled: Dict[str, Any] = {"model": model, "messages": messages}
         for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "user"):
             if key in payload:
@@ -925,16 +1140,19 @@ class _Handler(BaseHTTPRequestHandler):
             "coverage": coverage,
             "low_coverage": low_coverage,
         }
+        if full_fallback:
+            doc_savings["fallback"] = "full_doc"
+            doc_savings["full_fallback"] = True
         return assembled, doc_savings
 
     @staticmethod
     def _doc_meta(result: PipelineResult) -> Dict[str, Any]:
         """The ``optimizer`` block attached to doc-ask response bodies."""
         ds = result.doc_savings or {}
-        sent = 0 if result.decision.route in ("cache", "local") else result.record.canonical_tokens
+        sent = 0 if result.decision.route in ("cache", "local", "semantic") else result.record.canonical_tokens
         full = int(ds.get("full_tokens", 0))
         avoided = max(0, full - sent)
-        return {
+        meta: Dict[str, Any] = {
             "mode": "doc",
             "doc_id": ds.get("doc_id", ""),
             "route": result.decision.route,
@@ -949,6 +1167,10 @@ class _Handler(BaseHTTPRequestHandler):
             "coverage": ds.get("coverage"),
             "low_coverage": bool(ds.get("low_coverage", False)),
         }
+        # M6 quality gate: only present when the full-document fallback fired.
+        if ds.get("fallback"):
+            meta["doc_fallback"] = ds["fallback"]
+        return meta
 
     # -------------------------------------------------------------- local out
     def _stream_local(self, response: Dict[str, Any]) -> None:
@@ -1172,6 +1394,9 @@ class _Handler(BaseHTTPRequestHandler):
         protocol: str = "openai",
         endpoint: str = "",
         started: Optional[float] = None,
+        tier: str = "",
+        secrets_detected: int = 0,
+        secrets_redacted: int = 0,
     ) -> None:
         forwarded = dict(payload)
         # Session Governor: a stable prompt_cache_key (the session id) tells the
@@ -1310,11 +1535,14 @@ class _Handler(BaseHTTPRequestHandler):
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
                 protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
             )
             self._send_json(last_status, err)
             return
 
-        extra = self._route_headers(result)
+        extra = self._route_headers(result, secrets_redacted=secrets_redacted)
         if fallback_note:
             extra["X-Optimizer-Fallback"] = fallback_note
 
@@ -1328,6 +1556,9 @@ class _Handler(BaseHTTPRequestHandler):
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
                 protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
                 response_text=streamed,
             )
             return
@@ -1344,6 +1575,9 @@ class _Handler(BaseHTTPRequestHandler):
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
                 protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
             )
             self._send_json(502, {"error": {"message": "upstream returned non-JSON", "type": "upstream_error"}})
             return
@@ -1365,6 +1599,9 @@ class _Handler(BaseHTTPRequestHandler):
             upstream_ms=upstream_ms,
             upstream_cached=cached, fallback=fallback_note,
             protocol=protocol,
+            tier=tier,
+            secrets_detected=secrets_detected,
+            secrets_redacted=secrets_redacted,
             response_text=self.pipeline._extract_content(parsed, protocol=protocol) or "",
         )
         self._send_json(200, parsed, extra=extra)
@@ -1628,6 +1865,15 @@ class TokenOptimizerProxy:
                 self.store = ConversationStore(self.config.conversation_db)
             except Exception as exc:  # pragma: no cover - defensive
                 print(f"[tokan] conversation store unavailable ({exc}); serving without", flush=True)
+        # M6 routing (opt-in): the Adaptive Task Router only classifies unless
+        # the operator set --tier1_model (see ProxyConfig.tier1_model).
+        self._task_router = None
+        if self.config.task_router:
+            from ..task_router import AdaptiveTaskRouter
+
+            self._task_router = AdaptiveTaskRouter(
+                low_cost_model=self.config.tier1_model or "gpt-4o-mini"
+            )
 
         outer = self
 
@@ -1636,6 +1882,7 @@ class TokenOptimizerProxy:
             config = outer.config
             receipts = outer.receipts
             store = outer.store
+            _task_router = outer._task_router
 
         self._server = _GatewayServer((self.config.host, self.config.port), Handler)
         self._thread: Optional[threading.Thread] = None

@@ -414,6 +414,13 @@ token-optimizer --help              # All commands and flags
 --cache-db PATH                     # sqlite file for a persistent edge cache (survives restarts)
 --fallback-model MODEL              # retry once with this model on model_not_supported/model_not_found
 --log-requests                      # print one receipt line per request (route, tokens, latency)
+--api-keys K1,K2                    # inbound auth keys (env TOKAN_API_KEYS); Bearer or
+                                    #   X-Optimizer-Api-Key accepted. Required off-loopback.
+--allow-insecure                    # acknowledge a non-loopback bind with no keys (refused otherwise)
+--redact-secrets                    # replace detected secrets before digest/upstream (default: detect + disclose)
+--doc-fallback-full                 # quality gate: low-coverage doc asks send the full document
+--task-router                       # classify requests into routing tiers (disclose only; no rewrites)
+--tier1-model MODEL                 # opt-in model rewrite for tier_1 requests (never defaulted)
 ```
 
 ---
@@ -458,6 +465,7 @@ price_per_million_tokens = 2.50
 | `COPILOT_PROVIDER_API_KEY` | Key Copilot CLI sends upstream (may be omitted if the gateway holds it) |
 | `TOKAN_CACHE_ENDPOINT` | Override remote cache endpoint |
 | `TOKAN_NAMESPACE` | Override cache namespace |
+| `TOKAN_API_KEYS` | Inbound gateway keys, comma-separated (same as `--api-keys`) |
 
 ---
 
@@ -1320,16 +1328,63 @@ docker logs -f tokan
 
 ## Security Considerations
 
+### Inbound authentication (M6)
+
+By default the gateway binds `127.0.0.1` and needs no key — the OS
+loopback interface is the boundary. When you expose it (LAN, container,
+team gateway), **require a key**:
+
+```bash
+export TOKAN_API_KEYS="team-a-key,team-b-key"    # or: --api-keys "k1,k2"
+token-optimizer serve --host 0.0.0.0 --port 4040
+```
+
+- Clients send a key as `Authorization: Bearer <key>` **or**
+  `X-Optimizer-Api-Key: <key>` — either is accepted, compared with
+  `hmac.compare_digest` (constant time), never echoed in errors.
+- **Fail-closed:** binding a non-loopback host with no keys refuses to
+  start unless you pass `--allow-insecure` to acknowledge the open bind.
+- `/healthz` stays open (probes); `/metrics`, `/receipts` and
+  `/dashboard` require the key like everything else — they disclose
+  operational detail.
+- 401s are counted (`auth_failures` on `/metrics`, an **Auth failures**
+  dashboard tile) so probing is visible.
+- **Copilot / BYOK pattern:** the client's own credential can *be* the
+  gateway key. A Copilot OAuth token passed as `Bearer` doubles as both
+  the passthrough credential and the inbound key — bind it via
+  `--api-keys "$(gh auth token)"`. Alternatively, agents that can set
+  headers send the provider credential in `Authorization` **plus** the
+  gateway key in `X-Optimizer-Api-Key`; both are checked.
+
+### Secret hygiene (M6)
+
+Prompts routinely contain credentials — pasted configs, `.env` excerpts,
+stack traces with tokens. Tokan handles them two ways:
+- **Detect-and-disclose (default).** Every payload is scanned for ten
+  *documented* credential formats (AWS, GitHub, OpenAI, Anthropic, Google,
+  Slack, Stripe, npm, JWT, PEM private-key blocks — precision over recall:
+  no entropy guessing, so your source code is not falsely accused).
+  Findings are reported — receipt `secrets_detected`, metrics counters, a
+  **Secrets found** dashboard tile — and the bytes are **untouched**.
+- **`--redact-secrets` (opt-in).** Each finding is replaced with
+  `[REDACTED:<type>]` *before* canonicalization, the cache digest and the
+  upstream call. Nothing stored or forwarded can contain the secret, and
+  redaction is deterministic: two prompts differing only in the secret
+  itself fingerprint to the **same digest**, so the cache key can never
+  encode it. Scanning is capped at 2 MB per string value.
+
 ### API Key Management
 
 - **Never commit API keys** to version control
 - Use environment variables: `export OPENAI_API_KEY=sk-...`
+  (gateway keys: `export TOKAN_API_KEYS=...`)
 - Or config file: `~/.config/token-optimizer/config.toml` (mode `0600`)
 - For systemd: use `EnvironmentFile=-/etc/tokan.env` (mode `0600`, owned by `tokan:tokan`)
 
 ### Network Security
 
-- **Bind to localhost** by default (`--host 127.0.0.1`); only expose publicly with authentication
+- **Bind to localhost** by default (`--host 127.0.0.1`); non-loopback
+  binds without keys are refused (see above)
 - **TLS termination**: use nginx/cloud load balancer in front (Tokan speaks plain HTTP)
 - **Firewall**: allow inbound only on the gateway port (default 4040)
 

@@ -1,8 +1,8 @@
 {
   "name": "vscode-tokan",
-  "displayName": "Tokan Enterprise Gateway",
-  "description": "Routes IDE traffic to the enterprise Tokan gateway with live ROI metrics",
-  "version": "0.1.0",
+  "displayName": "Tokan Gateway",
+  "description": "Points IDE traffic at your local Tokan token-optimization gateway and shows live ROI metrics in the status bar",
+  "version": "0.2.0",
   "publisher": "tokan-enterprise",
   "engines": {
     "vscode": "^1.85.0"
@@ -28,17 +28,17 @@
       }
     ],
     "configuration": {
-      "title": "Tokan Enterprise",
+      "title": "Tokan",
       "properties": {
         "tokan.gatewayUrl": {
           "type": "string",
-          "default": "https://tokan.ai.internal.company.com/v1",
-          "description": "Enterprise Tokan gateway endpoint"
+          "default": "http://127.0.0.1:4040/v1",
+          "description": "Tokan gateway endpoint (default: the local gateway from `token-optimizer serve`)"
         },
         "tokan.authToken": {
           "type": "string",
           "default": "",
-          "description": "API auth token for gateway",
+          "description": "Gateway API key (one of --api-keys / TOKAN_API_KEYS). Sent as X-Optimizer-Api-Key and Bearer on metrics/commands. Leave empty when the gateway runs without inbound auth (loopback default).",
           "scope": "resource"
         }
       }
