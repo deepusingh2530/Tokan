@@ -190,17 +190,33 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 def cmd_index(args: argparse.Namespace) -> int:
     from pathlib import Path
 
-    from .repo_index import DEFAULT_IGNORE, build_index
+    from .repo_index import DEFAULT_IGNORE, SymbolCache, build_graph, build_index
 
     root = Path(args.root).resolve()
     ignore = DEFAULT_IGNORE | set(args.ignore or [])
-    content = build_index(root, ignore, args.max_bytes)
+    cache = SymbolCache(root / args.cache) if args.cache else None
+    content = build_index(root, ignore, args.max_bytes, cache=cache)
     if args.out == "-":
         print(content)
     else:
         out_path = root / args.out
         out_path.write_text(content, encoding="utf-8")
-        print(f"wrote {out_path} ({len(content.encode())} bytes, budget {args.max_bytes})")
+        extra = ""
+        if cache is not None:
+            extra = f", cache {cache.hits} hit/{cache.misses} miss"
+        print(f"wrote {out_path} ({len(content.encode())} bytes, budget {args.max_bytes}{extra})")
+    if args.graph_out:
+        import json
+
+        graph = build_graph(root, ignore, cache=cache)
+        graph_path = root / args.graph_out
+        graph_path.write_text(json.dumps(graph.to_json(), indent=2), encoding="utf-8")
+        stats = graph.stats()
+        print(
+            f"wrote {graph_path} ({stats['symbols']} symbols, "
+            f"{stats['reference_edges']} refs, {stats['import_edges']} imports, "
+            f"{stats['test_edges']} test edges)"
+        )
     return 0
 
 
@@ -325,6 +341,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--out", default="AGENTS.md", help="'-' prints to stdout")
     p_index.add_argument("--max-bytes", type=int, default=8192)
     p_index.add_argument("--ignore", action="append", default=[])
+    p_index.add_argument(
+        "--cache", default=None, metavar="PATH",
+        help="incremental symbol cache (relative to root): unchanged files are "
+             "not re-read on rebuilds (e.g. .git/tokan-index.json)",
+    )
+    p_index.add_argument(
+        "--graph-out", default=None, metavar="PATH",
+        help="also write the relationship graph (definitions/references/imports "
+             "tests) as JSON, relative to root (e.g. .git/tokan-graph.json)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     p_stats = sub.add_parser("stats", help="metrics from a running gateway")
