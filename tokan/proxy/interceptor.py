@@ -37,6 +37,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from ..cdm import estimate_tokens
 from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
+from .. import canonical
 from ..memory import ContextManifest, ConversationStore, content_digest
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
 from ..session import SESSION_HEADER
@@ -271,10 +272,12 @@ class _Handler(BaseHTTPRequestHandler):
         # Conversation memory: a request id ties receipt, manifest and events
         # together. Only added when the store is on, so flag-off receipts stay
         # byte-identical to prior releases.
-        if self.store is not None:
-            rec["rid"] = hashlib.sha256(
-                f"{rec['ts']}|{rec['digest']}|{self.path}".encode("utf-8")
-            ).hexdigest()[:16]
+        # Request id ties receipt, manifest and stored events together. Added
+        # unconditionally since M2 (additive key — existing consumers read
+        # specific receipt fields, so this is backward compatible).
+        rec["rid"] = hashlib.sha256(
+            f"{rec['ts']}|{rec['digest']}|{self.path}".encode("utf-8")
+        ).hexdigest()[:16]
         self.receipts.append(rec)
         if self.config.log_requests:
             line = (
@@ -389,6 +392,20 @@ class _Handler(BaseHTTPRequestHandler):
                     store.append(
                         conv, source="assistant", kind="message", content=answer_content
                     )
+            # Canonical-model stats: exercise the typed parse on real traffic
+            # (M2) so its fidelity is observed in production manifests — the
+            # governor (M3) consumes the same parse.
+            canonical_stats: Dict[str, int] = {}
+            try:
+                req = canonical.parse(payload, protocol=protocol)
+                canonical_stats = {
+                    "messages": len(req.messages),
+                    "tools": len(req.tools),
+                    "parts": sum(len(m.parts) for m in req.messages),
+                    "extensions": len(req.extensions),
+                }
+            except Exception:
+                pass  # manifest still records; canonical stats are best-effort
             manifest = ContextManifest(
                 rid=rid,
                 conversation=conv,
@@ -418,6 +435,7 @@ class _Handler(BaseHTTPRequestHandler):
                     if result.volatile_scrubbed
                     else {}
                 ),
+                canonical=canonical_stats,
             )
             store.append(conv, source="optimization", kind="manifest", content=manifest.as_dict())
         except Exception as exc:  # fail open — memory is never in the hot path

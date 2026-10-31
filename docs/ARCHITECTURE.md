@@ -34,8 +34,9 @@ What exists and works today, verified by tests and live traffic:
 
 Known correctness gaps discovered during assessment:
 
-- `EdgeCache` LRU is properly locked (verified); only its hit/miss counters
-  race benignly. `SessionMetrics` counters have no lock — M2.
+- `EdgeCache` LRU is properly locked (verified); its hit/miss counters raced
+  benignly, and `SessionMetrics` counters had no lock — both fixed in M2
+  (thread-safe counters, tested under 8-thread hammering).
 - `SessionMetrics` counters have no lock (same thread-safety concern) — M2.
 
 ## 2. Gap analysis against the target architecture
@@ -46,7 +47,7 @@ Numbering follows the target module list in the master plan.
 |---|---|---|---|
 | 1 | Protocol adapters | interceptor path-dispatch + `prepare()` | no canonical model; per-protocol ad-hoc projection; no reconstruction guarantee |
 | 2 | Auth/scope guard | — | no inbound auth, no tenant/user scope (M6) |
-| 3 | Canonical request model | implicit `messages` list | no typed model, no extension container (M2) |
+| 3 | Canonical request model | `tokan/canonical.py` (M2) | pipeline adoption in M3 (governor consumes `fingerprint_view`) |
 | 4 | Content classifier | heuristics inside CDM | no typed content classes/authority/fidelity (M3) |
 | 5 | Secret protector | none | secret detection/redaction (M6) |
 | 6 | Conversation store | — | **M1 (this milestone)** |
@@ -79,10 +80,21 @@ Small, independently testable milestones. Each lands with tests + measurements.
   (SQLite), deterministic `ConversationState` extraction, `ContextManifest`
   skeleton, observe-only gateway wiring behind `--conversation-db`. Zero
   behavior change when the flag is off (parity-tested).
+- **M2 (done): Canonical request model** — `tokan/canonical.py`: typed
+  `CanonicalRequest` for all four wires with structured content preserved
+  (images/tool calls/tool results never flattened), extension container for
+  unmodeled provider fields, byte-equal `to_payload()` reconstruction
+  (round-trip tested), and `fingerprint_view()` that reproduces
+  `pipeline.prepare()`'s digest exactly (parity-tested; cache keys stable
+  when M3 adopts it). Receipts gain request ids unconditionally (additive
+  key); `SessionMetrics` and `EdgeCache` counters are thread-safe; manifests
+  record canonical-model stats on live traffic.
 - **M2: Canonical request model** — typed `CanonicalRequest` with extension
   container and lossless reconstruction for all four protocols; receipts gain
   request ids unconditionally; `SessionMetrics` locking. The store starts
-  recording assistant responses on streaming paths too.
+  recording assistant responses on streaming paths too. (Done — streaming
+  responses were already recorded in M1; M2 added the canonical model,
+  unconditional rid, and counter locking.)
 - **M3: Content classification + compression policy engine** — explicit L0–L4
   compression levels bound to content classes; authority protection
   (system/developer/tool schemas never above L1).
@@ -167,8 +179,9 @@ can report real inclusion/omission decisions):
 }
 ```
 
-Stored as a `kind="manifest"` event; surfaced in receipts (`rid` key) only when
-the store is enabled, so flag-off behavior stays byte-identical.
+Stored as a `kind="manifest"` event (never a response header — wire
+compatibility). Receipts carry a request `rid` unconditionally since M2
+(additive key, so existing consumers are unaffected).
 
 ### 4.4 Gateway wiring (observe-only)
 
