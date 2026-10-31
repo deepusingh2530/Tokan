@@ -40,13 +40,13 @@ class TestHandshake(unittest.TestCase):
     def test_tools_list_schema(self):
         tools = call(self.server, "tools/list")["result"]["tools"]
         names = {t["name"] for t in tools}
-        self.assertEqual(names, {"optimize_context", "repo_index", "cache_lookup",
-                                 "cache_store", "session_metrics",
-                                 "doc_ingest", "doc_search"})
+        self.assertEqual(names, {"optimize_context", "repo_index", "repo_graph",
+                                 "cache_lookup", "cache_store", "session_metrics",
+                                 "doc_ingest", "doc_search", "evidence"})
         for tool in tools:
             self.assertIn("inputSchema", tool)
             self.assertIn("description", tool)
-        self.assertEqual(len(TOOLS), 7)
+        self.assertEqual(len(TOOLS), 9)
 
 
 class TestTools(unittest.TestCase):
@@ -77,6 +77,33 @@ class TestTools(unittest.TestCase):
         self.assertGreater(data["original_tokens"], 0)
         self.assertLessEqual(data["compact_tokens"], data["original_tokens"])
         self.assertIn(data["route"], ("llm", "cache", "local"))
+
+    def test_repo_graph_tool_budgeted(self):
+        resp = call(
+            self.server,
+            "tools/call",
+            {"name": "repo_graph", "arguments": {"root": ".", "max_bytes": 1024}},
+        )
+        data = self._payload(resp)
+        self.assertIn("definitions", data)
+        self.assertIn("stats", data)
+        self.assertIn(data["truncated"], (True, False))
+        # budget honored (the truncated key is sized before the loop exits)
+        self.assertLessEqual(len(json.dumps(data, indent=2).encode()), 1024 + 64)
+        self.assertGreater(data["stats"]["symbols"], 0)
+
+    def test_repo_graph_tool_full_output_not_truncated_here(self):
+        resp = call(
+            self.server,
+            "tools/call",
+            {"name": "repo_graph", "arguments": {"root": ".", "max_bytes": 240000}},
+        )
+        data = self._payload(resp)
+        self.assertFalse(data["truncated"])
+        # cross-checks against the real repo: symbols land where they live
+        self.assertEqual(data["definitions"].get("ContextGovernor"), "tokan/governor.py")
+        self.assertIn("tokan/pipeline.py", data.get("references", {}).get("ContextGovernor", []))
+        self.assertIn("tests/test_governor.py", data.get("tests", {}).get("tokan/governor.py", []))
 
     def test_optimize_context_bad_input_is_tool_error(self):
         resp = call(
@@ -149,7 +176,7 @@ class TestStdioLoop(unittest.TestCase):
         self.assertEqual(responses[0]["id"], 1)
         self.assertEqual(responses[0]["result"]["protocolVersion"], PROTOCOL_VERSION)
         self.assertEqual(responses[1]["id"], 2)
-        self.assertEqual(len(responses[1]["result"]["tools"]), 7)
+        self.assertEqual(len(responses[1]["result"]["tools"]), 9)
 
     def test_tool_exception_becomes_error_result(self):
         server = MCPServer()
