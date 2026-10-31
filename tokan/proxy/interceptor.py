@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from ..cdm import estimate_tokens
-from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
+from ..doc import DEFAULT_TOP_K, LOW_COVERAGE, assemble_messages, full_resend_tokens
 from .. import canonical
 from ..policy import CompressionPolicy
 from ..memory import ContextManifest, ConversationStore, content_digest
@@ -274,6 +274,11 @@ class _Handler(BaseHTTPRequestHandler):
             "doc_id": ds.get("doc_id", "") if ds else "",
             "fallback": fallback,
         }
+        # M5 doc-ask quality disclosure — additive keys, and only on doc
+        # receipts, so every other receipt stays byte-identical.
+        if ds and ds.get("coverage") is not None:
+            rec["coverage"] = ds["coverage"]
+            rec["low_coverage"] = bool(ds.get("low_coverage", False))
         # Context Governor (M4): budget decision, only when the governor ran.
         # Additive keys — a governor-off receipt is byte-identical to M3's.
         plan = result.governor_plan
@@ -304,6 +309,10 @@ class _Handler(BaseHTTPRequestHandler):
                 line += f" prefix_reuse={prefix_reused}"
             if ds:
                 line += f" doc={ds['doc_id']} avoided={max(0, original - sent)}tok"
+                if ds.get("low_coverage"):
+                    line += f" coverage={ds.get('coverage', 0)}(LOW)"  # M5 quality flag
+                elif ds.get("coverage") is not None:
+                    line += f" coverage={ds['coverage']}"
             if upstream_cached:
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
@@ -568,6 +577,8 @@ class _Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">Docs</div><div class="v" title="Documents ingested — stored once, reused by every question">{esc(m.get('doc_ingests', 0))}</div></div>
  <div class="card"><div class="k">Doc Q&amp;A</div><div class="v" title="Document questions answered from summary + retrieved excerpts">{esc(m.get('doc_questions', 0))}</div></div>
  <div class="card"><div class="k">Doc avoided</div><div class="v" title="Tokens never sent because retrieval replaced the full-document resend (baseline = whole doc + question)">{esc(m.get('doc_tokens_avoided', 0))}</div></div>
+ <div class="card"><div class="k">Low coverage</div><div class="v" title="Doc Q&As whose question outran the document's vocabulary — the answer may not be supported (M5)">{esc(m.get('doc_low_coverage', 0))}</div></div>
+ <div class="card"><div class="k">Evidence</div><div class="v" title="Ranked evidence searches served across ingested documents (M5)">{esc(m.get('evidence_searches', 0))}</div></div>
  <div class="card"><div class="k">Fallbacks</div><div class="v">{esc(m['fallbacks'])}</div></div>
  <div class="card"><div class="k">Cache entries</div><div class="v">{esc(c['entries'])}</div></div>
  <div class="card"><div class="k">Hit rate</div><div class="v">{esc(c['hit_rate'])}</div></div>
@@ -590,7 +601,8 @@ class _Handler(BaseHTTPRequestHandler):
         # wires — recognized before the protocol classifier 404s them.
         is_ingest = self.path in ("/v1/ingest", "/ingest")
         is_doc_ask = self.path in ("/v1/doc/ask", "/doc/ask")
-        if protocol is None and not (is_ingest or is_doc_ask):
+        is_evidence = self.path in ("/v1/evidence", "/evidence")
+        if protocol is None and not (is_ingest or is_doc_ask or is_evidence):
             self._send_json(404, {"error": {"message": f"unknown path {self.path}", "type": "invalid_request_error"}})
             return
         try:
@@ -603,6 +615,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if is_ingest:
             self._handle_ingest(payload)
+            return
+
+        if is_evidence:
+            self._handle_evidence(payload)
             return
 
         doc_savings: Optional[Dict[str, Any]] = None
@@ -666,8 +682,24 @@ class _Handler(BaseHTTPRequestHandler):
                     self._stream_local_responses(response)
                 else:
                     self._stream_local(response)
-            else:
-                self._send_json(200, response, extra=self._route_headers(result))
+                self._record_receipt(
+                    payload, result,
+                    route=("semantic" if result.semantic else result.decision.route),
+                    status=200,
+                    ms=(time.perf_counter() - started) * 1000,
+                    upstream_ms=0.0,
+                    protocol=protocol,
+                    response_text=(
+                        result.local_answer
+                        or (result.cached_value if isinstance(result.cached_value, str) else "")
+                    ),
+                )
+                return
+            # Record BEFORE responding (streams record after their relay,
+            # which IS the response). With the threaded gateway, sending
+            # first lets a concurrent follow-up request record its receipt
+            # before this one — the receipt log must stay in completion
+            # order so "the last receipt is my request" always holds.
             self._record_receipt(
                 payload, result,
                 # A semantic hit is a fuzzy reuse, not an exact digest repeat —
@@ -683,6 +715,7 @@ class _Handler(BaseHTTPRequestHandler):
                     or (result.cached_value if isinstance(result.cached_value, str) else "")
                 ),
             )
+            self._send_json(200, response, extra=self._route_headers(result))
             return
 
         # 2) Forward compacted payload upstream.
@@ -768,6 +801,62 @@ class _Handler(BaseHTTPRequestHandler):
             "next": 'POST /v1/doc/ask {"doc_id": "...", "question": "...", "model": "..."}',
         })
 
+    def _handle_evidence(self, payload: Dict[str, Any]) -> None:
+        """``POST /v1/evidence`` — ranked evidence units over *ingested docs only*.
+
+        Security boundary (M5): this endpoint is served over unauthenticated
+        HTTP, so it never walks the filesystem — repo-graph evidence is
+        available through the MCP ``evidence`` tool (agent-local trust, same
+        as ``repo_index``) and the CLI, not here. Docs-only keeps the surface
+        equivalent to what ``/v1/ingest`` already exposed.
+
+        Scoring honesty: each unit carries its store-native score (TF-IDF
+        cosine for docs) and ``source``; no cross-store calibration is claimed.
+        """
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            self._send_json(400, {
+                "error": {"message": "missing 'query' — POST {\"query\": \"...\"} "
+                                     "(optional: top_k, doc_ids[])",
+                          "type": "invalid_request_error"},
+            })
+            return
+        try:
+            top_k = int(payload.get("top_k") or 5)
+        except (TypeError, ValueError):
+            top_k = 5
+        top_k = max(1, min(20, top_k))
+        doc_ids = payload.get("doc_ids")
+        if doc_ids is not None and not isinstance(doc_ids, list):
+            self._send_json(400, {
+                "error": {"message": "'doc_ids' must be a list of doc ids",
+                          "type": "invalid_request_error"},
+            })
+            return
+
+        from ..evidence import EvidenceRetriever
+
+        retriever = EvidenceRetriever(self.pipeline.documents)  # no graph: docs only
+        units = retriever.search(query, top_k=top_k, doc_ids=doc_ids)
+        self.pipeline.metrics.record_evidence(len(units))
+        if self.config.log_requests:
+            print(
+                f"{time.strftime('%H:%M:%S')} POST /v1/evidence "
+                f"query={query[:40]!r} units={len(units)} "
+                f"tokens={sum(u.tokens for u in units)}",
+                flush=True,
+            )
+        self._send_json(200, {
+            "query": query,
+            "units": [u.as_dict() for u in units],
+            "count": len(units),
+            "tokens": sum(u.tokens for u in units),
+            # Disclosed, not hidden: repo evidence lives behind MCP/CLI only.
+            "scopes": ["doc"],
+            "note": "repo-symbol evidence is served by the MCP 'evidence' tool "
+                    "(and CLI), not over unauthenticated HTTP",
+        })
+
     def _assemble_doc_ask(
         self, payload: Dict[str, Any]
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
@@ -813,6 +902,8 @@ class _Handler(BaseHTTPRequestHandler):
         top_k = max(1, min(10, top_k))
 
         messages, idxs, chunks = assemble_messages(doc, question, top_k=top_k)
+        coverage = round(doc.coverage(question), 3)  # M5: O(question), no retrieval
+        low_coverage = coverage < LOW_COVERAGE
         assembled: Dict[str, Any] = {"model": model, "messages": messages}
         for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "user"):
             if key in payload:
@@ -827,6 +918,12 @@ class _Handler(BaseHTTPRequestHandler):
             "chunks_used": len(chunks),
             "retrieved": [i + 1 for i in idxs],  # 1-based, as numbered in the prompt
             "question_tokens": estimate_tokens(question),
+            # M5 coverage: honest disclosure of how much of the question's
+            # vocabulary the document can even speak to. Low coverage does not
+            # change the route (no fabricated "cannot find it" local answer) —
+            # it strengthens the abstention instruction and gets disclosed.
+            "coverage": coverage,
+            "low_coverage": low_coverage,
         }
         return assembled, doc_savings
 
@@ -847,6 +944,10 @@ class _Handler(BaseHTTPRequestHandler):
             "sent_tokens": sent,          # what Tokan actually forwarded
             "tokens_avoided": avoided,
             "avoided_pct": round(100.0 * avoided / full, 2) if full else 0.0,
+            # M5: how much of the question the document can speak to, disclosed
+            # even when healthy — a caller comparing receipts can see quality.
+            "coverage": ds.get("coverage"),
+            "low_coverage": bool(ds.get("low_coverage", False)),
         }
 
     # -------------------------------------------------------------- local out
@@ -1203,7 +1304,6 @@ class _Handler(BaseHTTPRequestHandler):
                 err = json.loads(last_detail)
             except ValueError:
                 err = {"error": {"message": last_detail[:500], "type": "upstream_error"}}
-            self._send_json(last_status, err)
             self._record_receipt(
                 payload, result, route="llm", status=last_status,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
@@ -1211,6 +1311,7 @@ class _Handler(BaseHTTPRequestHandler):
                 fallback=fallback_note,
                 protocol=protocol,
             )
+            self._send_json(last_status, err)
             return
 
         extra = self._route_headers(result)
@@ -1237,7 +1338,6 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             parsed = json.loads(body.decode("utf-8"))
         except ValueError:
-            self._send_json(502, {"error": {"message": "upstream returned non-JSON", "type": "upstream_error"}})
             self._record_receipt(
                 payload, result, route="llm", status=502,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
@@ -1245,6 +1345,7 @@ class _Handler(BaseHTTPRequestHandler):
                 fallback=fallback_note,
                 protocol=protocol,
             )
+            self._send_json(502, {"error": {"message": "upstream returned non-JSON", "type": "upstream_error"}})
             return
 
         self.pipeline.record_llm(result, parsed, protocol=protocol)
@@ -1255,7 +1356,9 @@ class _Handler(BaseHTTPRequestHandler):
         # Doc Governor: attach the retrieval economics to the answer body.
         if result.doc_savings is not None:
             parsed["optimizer"] = self._doc_meta(result)
-        self._send_json(200, parsed, extra=extra)
+        # Record BEFORE responding — see the local-path note: receipts must
+        # stay in completion order even when the next request is already
+        # racing in on another thread.
         self._record_receipt(
             payload, result, route="llm", status=200,
             ms=(time.perf_counter() - started) * 1000 if started else 0.0,
@@ -1264,6 +1367,7 @@ class _Handler(BaseHTTPRequestHandler):
             protocol=protocol,
             response_text=self.pipeline._extract_content(parsed, protocol=protocol) or "",
         )
+        self._send_json(200, parsed, extra=extra)
 
     def _relay_stream(
         self, upstream_resp: Any, result: PipelineResult, *, protocol: str = "openai",

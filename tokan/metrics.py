@@ -46,6 +46,9 @@ class SessionMetrics:
         self.doc_full_tokens = 0         # naive baseline: full doc + question each time
         self.doc_sent_tokens = 0         # what Tokan actually forwarded
         self.doc_chunks_used = 0         # retrieved excerpts sent (quality signal)
+        self.doc_low_coverage = 0        # doc Q&As whose question outran the document (M5)
+        self.evidence_searches = 0       # /v1/evidence + MCP evidence calls (M5)
+        self.evidence_units = 0          # evidence units returned across those searches
 
     def record(self, route: str, original_tokens: int, optimized_tokens: int = 0) -> None:
         with self._lock:
@@ -121,18 +124,35 @@ class SessionMetrics:
             self.doc_ingests += 1
             self.doc_ingested_tokens += max(0, int(tokens))
 
-    def record_doc(self, *, full_tokens: int, sent_tokens: int, chunks_used: int = 0) -> None:
+    def record_doc(
+        self,
+        *,
+        full_tokens: int,
+        sent_tokens: int,
+        chunks_used: int = 0,
+        low_coverage: bool = False,
+    ) -> None:
         """Book one document Q&A request against its naive full-resend baseline.
 
         Kept out of ``tokens_saved`` on purpose: compaction savings and
         retrieval avoidance have different baselines and mixing them would
-        make both numbers harder to defend.
+        make both numbers harder to defend. ``low_coverage`` (M5) counts the
+        asks whose question outran the document — a quality signal, not a
+        saving.
         """
         with self._lock:
             self.doc_questions += 1
             self.doc_full_tokens += max(0, int(full_tokens))
             self.doc_sent_tokens += max(0, int(sent_tokens))
             self.doc_chunks_used += max(0, int(chunks_used))
+            if low_coverage:
+                self.doc_low_coverage += 1
+
+    def record_evidence(self, units: int) -> None:
+        """One evidence search was served, returning ``units`` ranked units."""
+        with self._lock:
+            self.evidence_searches += 1
+            self.evidence_units += max(0, int(units))
 
     @property
     def doc_tokens_avoided(self) -> int:
@@ -213,6 +233,9 @@ class SessionMetrics:
                 "doc_chunks_used": self.doc_chunks_used,
                 "doc_tokens_avoided": self.doc_tokens_avoided,
                 "doc_avoided_pct": self.doc_avoided_pct,
+                "doc_low_coverage": self.doc_low_coverage,
+                "evidence_searches": self.evidence_searches,
+                "evidence_units": self.evidence_units,
             }
 
     def reset(self) -> None:
@@ -237,3 +260,6 @@ class SessionMetrics:
             self.doc_full_tokens = 0
             self.doc_sent_tokens = 0
             self.doc_chunks_used = 0
+            self.doc_low_coverage = 0
+            self.evidence_searches = 0
+            self.evidence_units = 0
