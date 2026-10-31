@@ -1,13 +1,13 @@
 # Tokan Architecture
 
-Status: living document. Milestones M1–M4 landed; later milestones referenced by phase.
+Status: living document. Milestones M1–M5 landed; later milestones referenced by phase.
 
 Tokan is a provider-neutral token-optimization gateway for AI coding agents. It sits
 between agents (Copilot BYOK, Codex, Aider, Gemini CLI, any OpenAI/Anthropic/Gemini
 wire client) and upstream LLM providers, minimizing tokens sent upstream while
 preserving answer quality and full recoverability of the original context.
 
-## 1. Current assessment (as of M4)
+## 1. Current assessment (as of M5)
 
 What exists and works today, verified by tests and live traffic:
 
@@ -21,10 +21,11 @@ What exists and works today, verified by tests and live traffic:
 | Deterministic routing (JeV) | `tokan/jev/router.py`: regex-heuristic local/llm decision; local requires a registered executor answer (never fabricated) | production (binary; no tiers) |
 | Deterministic executors | `LocalExecutor` with a single `line_lookup` handler | minimal |
 | Session/prefix measurement | `tokan/session.py`: per-session prefix reuse (honest, disclosed-not-claimed) | production (in-memory) |
-| Document intelligence | `tokan/doc.py`: ingest-once, chunk, TF-IDF retrieve, extractive summary, honest "doc tokens avoided" accounting | production (lexical only, in-memory) |
-| Repository intelligence | `tokan/repo_index.py`: gitignore-aware walk, regex top-level symbols, budgeted markdown map | basic (full rebuild, regex-only) |
+| Document intelligence | `tokan/doc.py`: ingest-once, chunk, TF-IDF retrieve, extractive summary, honest "doc tokens avoided" accounting; M5 adds idf-weighted coverage detection (`Document.coverage`) with low-coverage abstention disclosure | production (lexical only, in-memory) |
+| Repository intelligence | `tokan/repo_index.py`: gitignore-aware walk, regex top-level symbols, budgeted markdown map; M5 adds incremental `SymbolCache` (mtime+size keyed) and `RepoGraph` (definitions/references/Python-import/test edges) | production (incremental, best-effort regex/import heuristics) |
+| Evidence retriever | `tokan/evidence.py` (M5): ranked units across ingested docs (TF-IDF cosine) + repo graph (documented name/path heuristic), labeled per-store scores, bounded excerpts | production (docs via HTTP+MCP; repo graph via MCP/CLI only) |
 | Metrics/receipts/dashboard | `tokan/metrics.py` + `/metrics`, `/receipts`, `/dashboard`, `X-Optimizer-*` headers, per-request receipts with token-accurate honest accounting | production (per-process) |
-| MCP tools | `tokan/mcp.py`: 7 stdio tools (optimize, repo_index, cache, metrics, doc) | production |
+| MCP tools | `tokan/mcp.py`: 9 stdio tools (optimize, repo_index, repo_graph, evidence, cache, metrics, doc) | production |
 | Deploy | `deploy/azure/main.bicep` (ACA + Redis + Key Vault), Dockerfile | production |
 | Conversation persistence | `tokan/memory.py` (M1): append-only SQLite `ConversationStore` + deterministic `ConversationState`, observe-only behind `--conversation-db` | production (fail-open) |
 | Context manifest | `ContextManifest` per request: route, tokens, digest, protected/compressed/omitted, canonical + policy + governor stats | production |
@@ -47,31 +48,31 @@ Numbering follows the target module list in the master plan.
 | # | Target module | Exists as | Gap |
 |---|---|---|---|
 | 1 | Protocol adapters | interceptor path-dispatch + `prepare()` | no canonical model; per-protocol ad-hoc projection; no reconstruction guarantee |
-| 2 | Auth/scope guard | — | no inbound auth, no tenant/user scope (M6) |
+| 2 | Auth/scope guard | `tokan/proxy/interceptor.py::_check_auth` (M6): key-based inbound auth via `--api-keys`/`TOKAN_API_KEYS`, `Authorization: Bearer` or `X-Optimizer-Api-Key`, constant-time compare, `/healthz` exempt, fail-closed bind gate (`ensure_bind_safety`) | tenant/user scope (schema column exists; not enforced) |
 | 3 | Canonical request model | `tokan/canonical.py` (M2) | pipeline adoption in M3 (governor consumes `fingerprint_view`) |
 | 4 | Content classifier | `tokan/policy.py` (M3) | typed classes + authority tiers; user/system capped L1 |
-| 5 | Secret protector | none | secret detection/redaction (M6) |
+| 5 | Secret protector | `tokan/secret.py` (M6): 10 documented patterns, overlap-safe, detect-and-disclose by default, opt-in `--redact-secrets` replaces with `[REDACTED:<type>]` before canonicalization/digest/upstream (digest-hygienic) | — |
 | 6 | Conversation store | `tokan/memory.py` (M1) | done |
 | 7 | Conversation state extractor | `ConversationState` (M1, deterministic) | done |
-| 8 | Context Governor | `tokan/governor.py` (M4) | progressive expansion loop (M6); gemini/responses shedding (M6) |
-| 9 | Repository intelligence | repo_index map | symbols/calls/tests graph, incremental (M5) |
-| 10 | Document intelligence | doc.py TF-IDF | semantic retrieval, coverage detection (M5) |
-| 11 | Relevance/dependency retriever | doc TF-IDF only | cross-store retrieval (M5) |
+| 8 | Context Governor | `tokan/governor.py` (M4) | progressive expansion loop (open); gemini/responses shedding (open) |
+| 9 | Repository intelligence | `SymbolCache` + `RepoGraph` (`tokan/repo_index.py`, M5): incremental index, definitions/references/imports/test edges, `index --cache/--graph-out`, MCP `repo_graph` | done (regex/import heuristics, documented) |
+| 10 | Document intelligence | doc.py TF-IDF + `Document.coverage` (M5): idf-weighted coverage detection, low-coverage prompt caveat + disclosure, `doc_low_coverage` counter; full-document fallback behind `--doc-fallback-full` (M6) | done |
+| 11 | Relevance/dependency retriever | `EvidenceRetriever` (`tokan/evidence.py`, M5): cross-store ranked units, per-store scores, `POST /v1/evidence` (docs) + MCP `evidence` (docs+repo) | done |
 | 12 | Token Budget Controller | `TokenBudget` + `context_window_for` (M4) | done (operator override via `--context-window`) |
 | 13 | CDM normalization | production | explicit L0–L4 levels + policy engine (`tokan/policy.py`, M3) |
 | 14 | Exact cache | production | scope keys lack tenant; key includes only model/temp/top_p/user (M2 scope work) |
 | 15 | Prefix-cache optimizer | `--prompt-cache-key` + stable ordering + session measurement | formal prompt-ordering module (deferred; measurement honest in `session.py`) |
 | 16 | Semantic cache | `SemanticAnswerCache` (M4, opt-in conservative) | done (factual-only, model-scoped, 0.97 threshold, TTL+LRU) |
 | 17 | Intermediate-artifact cache | none | summaries/embeddings/index caches (M3–M5) |
-| 18 | JeV decision engine | binary local/llm | multi-route policy + tiers (M6) |
-| 19 | Deterministic executors | line_lookup only | executor plugin API + suite (M6) |
-| 20 | Model router | single `--fallback-model` retry | capability tiers, chains, budget (M6) |
-| 21 | Prompt assembler | inline per-protocol + governor-driven `messages` shedding (M4) | gemini/responses governor assembly (M6) |
-| 22 | Quality gate | — | pre/post deterministic checks (M6) |
-| 23 | Progressive fallback | — | context expansion loop (M6) |
+| 18 | JeV decision engine | binary local/llm + M6 `AdaptiveTaskRouter` classify-only tiers (`--task-router`) | multi-route policy (open) |
+| 19 | Deterministic executors | line_lookup only | executor plugin API + suite (open) |
+| 20 | Model router | single `--fallback-model` retry + M6 `--tier1-model` opt-in rewrite | capability tiers, chains, budget (open) |
+| 21 | Prompt assembler | inline per-protocol + governor-driven `messages` shedding (M4) | gemini/responses governor assembly (open) |
+| 22 | Quality gate | doc low-coverage detection (M5) + `--doc-fallback-full` full-doc fallback (M6) | pre/post-call deterministic checks (open) |
+| 23 | Progressive fallback | governor expansion loop (M4) | — |
 | 24 | Memory update pipeline | cache fill only | M1 begins it (events); responses wired M2 |
 | 25 | Optimization receipts | receipts + headers + `ContextManifest` ledger (M1/M4) | done |
-| 26 | Metrics/tracing/eval | metrics + dashboard + benchmark scripts | OTel, locked counters, CI eval harness (M2–M6) |
+| 26 | Metrics/tracing/eval | metrics + dashboard + benchmark scripts + M6 counters (auth/secrets/doc-fallback/tiers) | OTel, CI eval harness (open) |
 
 ## 3. Phased plan
 
@@ -122,11 +123,49 @@ Small, independently testable milestones. Each lands with tests + measurements.
   TTL+LRU; semantic hits route as `semantic`, not `cache`, so the digest
   cache's hit rate stays honest. Measured overhead: +156µs on a 52-message
   conversation (~3µs/message), +30µs on a 10-turn; semantic probe 15µs.
-- **M5: Repository + document intelligence v2** — incremental symbol index,
-  dependency/test relationships, evidence-unit retrieval; doc coverage detection.
-- **M6: Quality gate + routing + production hardening** — pre/post-call
-  deterministic validation, multi-tier model routing, executor plugin API,
-  auth (bearer/tenant scoping), rate limits, OTel, eval harness in CI.
+- **M5 (done): Repository + document intelligence v2** — `tokan/repo_index.py`
+  gains an incremental `SymbolCache` (JSON on disk, keyed by
+  `(mtime_ns, size)`; a warm build re-reads nothing — verified by read-count
+  instrumentation; corrupt/stale caches fail open) and `RepoGraph` via
+  `build_graph()`: top-level symbol definitions (source files before test
+  files, first-definer-wins), whole-word cross-file references (excluding
+  every definer), Python import edges (line-anchored parse, longest-prefix
+  dotted resolution extended to the first imported name so `from a import b`
+  prefers `a/b.py`), and test→source edges (Python via resolved imports —
+  precise; non-Python via whole-symbol mention — best effort). Surfaced via
+  `index --cache/--graph-out` and the MCP `repo_graph` tool (budgeted JSON
+  with a `truncated` flag). `tokan/evidence.py` adds `EvidenceRetriever`:
+  one ranked list of evidence units across ingested documents (store-native
+  TF-IDF cosine) and the repo graph (documented heuristic
+  `best*(0.6+0.4*coverage)` capped 0.99; exact symbol matches intentionally
+  outrank moderate chunk cosines; scores are labeled per store and **not**
+  cross-calibrated — disclosed on every unit). HTTP `POST /v1/evidence`
+  searches ingested docs only (unauthenticated HTTP never walks the
+  filesystem; repo evidence lives behind MCP/CLI with agent-local trust).
+  Doc coverage detection: `Document.coverage` measures the idf-weighted
+  fraction of the question's content vocabulary the document contains
+  (stopwords dropped first); below the a-priori `LOW_COVERAGE=0.35` the
+  assembled prompt strengthens its abstention instruction and the ask is
+  disclosed (`coverage`/`low_coverage` in the response `optimizer` block,
+  receipts, console line, dashboard card, `doc_low_coverage` counter, MCP
+  `doc_search`). On labeled synthetic fixtures (8 answerable / 8 off-topic
+  questions) the split is 0/8 answerable flagged, 8/8 off-topic flagged —
+  reported honestly as synthetic, not production precision. The inverted
+  reference pass also made uncached graph builds ~9x faster on a 600-file
+  corpus (O(total identifiers) instead of O(symbols × files)).
+- **M6 (done): Hardening — inbound auth, secret hygiene, doc quality gate,
+  routing wire-up** — `--api-keys`/`TOKAN_API_KEYS` inbound auth (dual-header
+  candidates so BYOK provider credentials in `Authorization` never mask the
+  gateway key; `hmac.compare_digest`; `/healthz` exempt; non-loopback binds
+  fail closed without keys unless `--allow-insecure`), `tokan/secret.py`
+  detection with opt-in `--redact-secrets` (detect-and-disclose default;
+  redacted bytes never reach the cache digest), `--doc-fallback-full`
+  quality gate (low-coverage asks send the whole document, line-wrapped so
+  CDM long-line elision cannot truncate it), and `--task-router`
+  (`AdaptiveTaskRouter` classify-only: tier disclosed on receipts/headers/
+  `/metrics` `tiers`; `--tier1-model` opt-in model rewrite, never defaulted).
+  All flags default off — byte-identical to M5 when unset. Rate limits, OTel,
+  and the CI eval harness remain open (see §7/§8).
 
 ## 4. M1 — interfaces and storage schema
 
@@ -243,31 +282,37 @@ compatibility). Receipts carry a request `rid` unconditionally since M2
 
 ## 6. Security threat model (summary)
 
-Trust boundaries: agent → gateway (currently unauthenticated), gateway →
-provider (key injected server-side), gateway → stores (local disk).
+Trust boundaries: agent → gateway (M6: authenticated when `--api-keys` is
+set — the ACA production deployment runs with keys; loopback-only binds need
+none), gateway → provider (key injected server-side), gateway → stores (local
+disk).
 
 M1 mitigations: tenant column in the store schema (isolation from day one),
 per-event integrity digests, retention support, no secrets in manifests
 (digests and counts only), conversation content never logged unless
 `--log-requests`.
 
-Known accepted risks until M6: no inbound authentication (mitigated by bind
-address + network placement; ACA deployment is publicly reachable — auth is the
-top M6 item); no TLS on the gateway itself (terminate at ACA/ingress);
-`/dashboard` and `/receipts` unauthenticated.
+Resolved in M6: inbound authentication (`--api-keys`, dual-header candidates,
+constant-time compare, fail-closed bind gate); `/dashboard` and `/receipts`
+are behind the same auth as `/metrics`. Remaining accepted risks: no
+tenant/user scope enforcement (schema column exists); no TLS on the gateway
+itself (terminate at ACA/ingress); rate limiting not yet implemented (bind
+fail-closed + key auth are the current controls).
 
 ## 7. Observability plan
 
 M1: receipts + `/metrics` + `/dashboard` unchanged; manifests persisted for
-offline analysis. M2: request ids everywhere, locked counters. M6: OpenTelemetry
-traces per stage (prepare → governor → upstream), structured logs, no raw
-prompts by default.
+offline analysis. M2: request ids everywhere, locked counters. M6 added the
+auth/secrets/doc-fallback/tier counters on `/metrics` + dashboard cards.
+Still open: OpenTelemetry traces per stage (prepare → governor → upstream),
+structured logs, no raw prompts by default (prompts stay unlogged unless
+`--log-requests`).
 
 ## 8. Evaluation methodology
 
 Existing harnesses (`benchmarks/prefix_cache.py`, `scenarios.py`, `doc_qa.py`,
 `repo_ab.py`, Copilot A/B) provide token and quality baselines. M4 adds the
-quality gate with deterministic checks; M6 runs the workload matrix (long
+quality gate with deterministic checks. Still open: the workload matrix (long
 conversations, debugging, refactoring, tool-heavy loops, conflicting
 instructions, cache invalidation) in CI against golden datasets, comparing
 baseline vs lossless vs semantic vs aggressive vs progressive-fallback modes.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from typing import List, Optional
 
@@ -98,6 +99,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return 2
 
     pipeline = _build_pipeline(args)
+    api_keys = tuple(
+        k.strip() for k in (getattr(args, "api_keys", "") or "").split(",") if k.strip()
+    )
+    # M6 fail-closed: an off-loopback bind without keys must not start
+    # unless the operator explicitly acknowledges with --allow-insecure.
+    from .proxy.interceptor import ensure_bind_safety
+
+    ensure_bind_safety(
+        args.host, api_keys, allow_insecure=getattr(args, "allow_insecure", False)
+    )
     config = ProxyConfig(
         upstream_base=upstream,
         api_key=args.api_key,
@@ -113,6 +124,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
         log_requests=getattr(args, "log_requests", False),
         prompt_cache_key=getattr(args, "prompt_cache_key", False),
         conversation_db=getattr(args, "conversation_db", None),
+        api_keys=api_keys,
+        redact_secrets=getattr(args, "redact_secrets", False),
+        doc_fallback_full=getattr(args, "doc_fallback_full", False),
+        task_router=getattr(args, "task_router", False),
+        tier1_model=getattr(args, "tier1_model", None),
     )
     proxy = TokenOptimizerProxy(config, pipeline).start()
     gw = _gateway_info(args)
@@ -125,6 +141,18 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print(f"  edge cache    : {args.cdn or 'local LRU only'}"
           + (f" + sqlite({getattr(args, 'cache_db', None)})" if getattr(args, "cache_db", None) else ""), flush=True)
     print(f"  fallback model: {getattr(args, 'fallback_model', None) or 'none'}", flush=True)
+    print(
+        "  inbound auth  : "
+        + (f"{len(api_keys)} key(s) (Bearer or X-Optimizer-Api-Key)" if api_keys
+           else "disabled (loopback only)"),
+        flush=True,
+    )
+    print(
+        "  secrets       : "
+        + ("redact + disclose" if getattr(args, "redact_secrets", False)
+           else "detect + disclose (no mutation; --redact-secrets to replace)"),
+        flush=True,
+    )
     print(f"  jev threshold : {args.threshold}", flush=True)
     print(f"  metrics       : {gw.origin}/metrics", flush=True)
     print(f"  dashboard     : {gw.origin}/dashboard", flush=True)
@@ -190,17 +218,33 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 def cmd_index(args: argparse.Namespace) -> int:
     from pathlib import Path
 
-    from .repo_index import DEFAULT_IGNORE, build_index
+    from .repo_index import DEFAULT_IGNORE, SymbolCache, build_graph, build_index
 
     root = Path(args.root).resolve()
     ignore = DEFAULT_IGNORE | set(args.ignore or [])
-    content = build_index(root, ignore, args.max_bytes)
+    cache = SymbolCache(root / args.cache) if args.cache else None
+    content = build_index(root, ignore, args.max_bytes, cache=cache)
     if args.out == "-":
         print(content)
     else:
         out_path = root / args.out
         out_path.write_text(content, encoding="utf-8")
-        print(f"wrote {out_path} ({len(content.encode())} bytes, budget {args.max_bytes})")
+        extra = ""
+        if cache is not None:
+            extra = f", cache {cache.hits} hit/{cache.misses} miss"
+        print(f"wrote {out_path} ({len(content.encode())} bytes, budget {args.max_bytes}{extra})")
+    if args.graph_out:
+        import json
+
+        graph = build_graph(root, ignore, cache=cache)
+        graph_path = root / args.graph_out
+        graph_path.write_text(json.dumps(graph.to_json(), indent=2), encoding="utf-8")
+        stats = graph.stats()
+        print(
+            f"wrote {graph_path} ({stats['symbols']} symbols, "
+            f"{stats['reference_edges']} refs, {stats['import_edges']} imports, "
+            f"{stats['test_edges']} test edges)"
+        )
     return 0
 
 
@@ -268,7 +312,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--host", default="127.0.0.1")
         p.add_argument("--port", type=int, default=4040)
         p.add_argument("--upstream", default="https://api.openai.com/v1")
-        p.add_argument("--api-key", default=None, help="OpenAI-compatible upstream key")
+        p.add_argument("--api-key",
+                       default=os.environ.get("TOKAN_UPSTREAM_API_KEY"),
+                       help="OpenAI-compatible upstream key. Defaults to env "
+                            "TOKAN_UPSTREAM_API_KEY (namespaced on purpose: OPENAI_API_KEY "
+                            "is NOT read here, so an agent's exported key can never be "
+                            "silently repurposed as the gateway's upstream credential). "
+                            "Env-only deployments keep the key out of argv / revision "
+                            "history (e.g. Azure Key Vault secret references).")
         p.add_argument("--anthropic-upstream", default="https://api.anthropic.com")
         p.add_argument("--anthropic-api-key", default=None, help="Anthropic upstream key")
         p.add_argument("--gemini-upstream", default="https://generativelanguage.googleapis.com")
@@ -310,6 +361,35 @@ def build_parser() -> argparse.ArgumentParser:
                             "only matches above --semantic-threshold are served.")
         p.add_argument("--semantic-threshold", type=float, default=0.97,
                        help="risk threshold for semantic reuse (default 0.97 = near-paraphrase only)")
+        # ---- M6: hardening + quality gate -------------------------------
+        p.add_argument("--api-keys", default=os.environ.get("TOKAN_API_KEYS", ""),
+                       help="comma-separated inbound API keys (or env TOKAN_API_KEYS): "
+                            "clients send one as 'Authorization: Bearer <key>' or "
+                            "'X-Optimizer-Api-Key: <key>'. A Copilot OAuth token can "
+                            "double as the gateway key (it is both). Empty = no inbound "
+                            "auth (loopback-only binds).")
+        p.add_argument("--allow-insecure", action="store_true",
+                       help="acknowledge binding a non-loopback host without --api-keys "
+                            "(refused otherwise: an open gateway spends your provider "
+                            "budget and sees every prompt)")
+        p.add_argument("--redact-secrets", action="store_true",
+                       help="replace detected secrets (AWS/GitHub/OpenAI/Anthropic keys, "
+                            "JWTs, private keys, ...) with '[REDACTED:<type>]' before "
+                            "anything leaves the machine. Off = detect-and-disclose only "
+                            "(receipts/metrics report what was seen; bytes untouched).")
+        p.add_argument("--doc-fallback-full", action="store_true",
+                       help="quality gate: when a doc question scores below the coverage "
+                            "threshold (the document likely cannot answer it), send the "
+                            "FULL document instead of weak excerpts — spends naive tokens "
+                            "on purpose to protect answer quality.")
+        p.add_argument("--task-router", action="store_true",
+                       help="classify each request into a routing tier (tier_0 local / "
+                            "tier_1 low-cost / tier_2 frontier) and disclose it on "
+                            "receipts, headers and /metrics. Classify-only by default.")
+        p.add_argument("--tier1-model", default=None,
+                       help="opt-in model rewrite for tier_1 (formatting/quick-fix) "
+                            "requests, e.g. gpt-4o-mini. Never defaulted: rewriting the "
+                            "model an agent asked for breaks BYOK/plan-gated flows.")
 
     p_serve = sub.add_parser("serve", help="run the optimization gateway")
     add_gateway_flags(p_serve)
@@ -325,6 +405,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--out", default="AGENTS.md", help="'-' prints to stdout")
     p_index.add_argument("--max-bytes", type=int, default=8192)
     p_index.add_argument("--ignore", action="append", default=[])
+    p_index.add_argument(
+        "--cache", default=None, metavar="PATH",
+        help="incremental symbol cache (relative to root): unchanged files are "
+             "not re-read on rebuilds (e.g. .git/tokan-index.json)",
+    )
+    p_index.add_argument(
+        "--graph-out", default=None, metavar="PATH",
+        help="also write the relationship graph (definitions/references/imports "
+             "tests) as JSON, relative to root (e.g. .git/tokan-graph.json)",
+    )
     p_index.set_defaults(func=cmd_index)
 
     p_stats = sub.add_parser("stats", help="metrics from a running gateway")

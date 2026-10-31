@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, TextIO
 from .adapters import GatewayInfo
 from .cdm import estimate_tokens
 from .pipeline import OptimizationPipeline
-from .repo_index import DEFAULT_IGNORE, build_index
+from .repo_index import DEFAULT_IGNORE, build_graph, build_index
 
 __all__ = ["MCPServer", "serve_stdio"]
 
@@ -75,6 +75,23 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "repo_graph",
+        "description": (
+            "Relationship graph over a repository's top-level symbols: which "
+            "file defines each symbol, which files reference it, Python import "
+            "edges, and which test files cover each source file. Use instead of "
+            "grepping when asked 'where is X defined / used / tested'. Walks "
+            "the repo in one pass; output is budgeted and reports truncation."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "root": {"type": "string", "description": "Repo root (defaults to cwd)."},
+                "max_bytes": {"type": "integer", "description": "Output budget (default 24000)."},
+            },
+        },
+    },
+    {
         "name": "cache_lookup",
         "description": (
             "Probe the semantic edge cache: does this exact or near-identical "
@@ -110,6 +127,34 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "evidence",
+        "description": (
+            "Ranked evidence units across ingested documents AND the repo "
+            "graph in one list: the chunks and symbols/paths most relevant to "
+            "a question, each with source labels and token counts. Pass 'root' "
+            "to include repo-symbol evidence (walks the repo in one pass); "
+            "without it, only ingested documents are searched. Use when a "
+            "question spans docs and code."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The question."},
+                "top_k": {"type": "integer", "description": "Units to return (default 5, max 50)."},
+                "doc_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Restrict doc evidence to these ids (default: all).",
+                },
+                "root": {
+                    "type": "string",
+                    "description": "Repo root for symbol/path evidence (optional; docs-only without it).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "doc_ingest",
         "description": (
             "Ingest a long document once (chunk + TF-IDF index + extractive "
@@ -135,7 +180,9 @@ TOOLS: List[Dict[str, Any]] = [
             "Retrieve the summary + top-k relevant excerpts of an ingested "
             "document for a question. Returns far fewer tokens than re-reading "
             "the full document; answer from the excerpts (they include their "
-            "chunk numbers for citation)."
+            "chunk numbers for citation). The answer includes a coverage score: "
+            "below 0.35 the document likely cannot answer the question — look "
+            "elsewhere rather than guessing."
         ),
         "inputSchema": {
             "type": "object",
@@ -243,6 +290,25 @@ class MCPServer:
             max_bytes = int(args.get("max_bytes") or 8192)
             return build_index(root, DEFAULT_IGNORE, max_bytes)
 
+        if name == "repo_graph":
+            from pathlib import Path
+
+            root = Path(args.get("root") or ".").resolve()
+            max_bytes = max(1024, int(args.get("max_bytes") or 24000))
+            data = build_graph(root, DEFAULT_IGNORE).to_json()
+            data["truncated"] = False  # present before sizing so the budget holds
+            original = json.loads(json.dumps(data))  # pristine copy to shrink from
+            cap: Any = None
+            truncated = False
+            while len(json.dumps(data, indent=2).encode()) > max_bytes and (cap is None or cap > 1):
+                truncated = True
+                cap = 256 if cap is None else max(1, cap // 2)
+                data["definitions"] = dict(list(original["definitions"].items())[:cap])
+                for key in ("references", "imports", "tests"):
+                    data[key] = {k: v[:cap] for k, v in list(original[key].items())[:cap]}
+            data["truncated"] = truncated
+            return json.dumps(data, indent=2)
+
         if name == "cache_lookup":
             text = args.get("text", "")
             use_semantic = args.get("semantic", True)
@@ -299,11 +365,16 @@ class MCPServer:
                 top_k = 3
             top_k = max(1, min(10, top_k))
             chunks, idxs = doc.retrieve(query, top_k=top_k)
+            from .doc import LOW_COVERAGE
+
+            coverage = round(doc.coverage(query), 3)  # M5 quality disclosure
             return json.dumps(
                 {
                     "doc_id": doc.doc_id,
                     "query": query,
                     "full_document_tokens": doc.total_tokens,
+                    "coverage": coverage,
+                    "low_coverage": coverage < LOW_COVERAGE,
                     "summary": doc.summary,
                     "summary_tokens": doc.summary_tokens,
                     "excerpts": [
@@ -313,6 +384,42 @@ class MCPServer:
                     "retrieved_tokens": estimate_tokens(doc.summary) + sum(
                         estimate_tokens(c) for c in chunks
                     ),
+                },
+                indent=2,
+            )
+
+        if name == "evidence":
+            from pathlib import Path as _Path
+
+            from .evidence import EvidenceRetriever
+
+            query = str(args.get("query") or "").strip()
+            if not query:
+                raise ValueError("evidence requires 'query'")
+            try:
+                top_k = int(args.get("top_k") or 5)
+            except (TypeError, ValueError):
+                top_k = 5
+            top_k = max(1, min(50, top_k))
+            doc_ids = args.get("doc_ids")
+            if doc_ids is not None and not isinstance(doc_ids, list):
+                raise ValueError("'doc_ids' must be a list of doc ids")
+            # Repo evidence is opt-in via 'root' (MCP runs with the agent's own
+            # trust, same as repo_index; the walk happens once per call).
+            graph = None
+            root = str(args.get("root") or "").strip()
+            if root:
+                graph = build_graph(_Path(root).expanduser().resolve(), DEFAULT_IGNORE)
+            retriever = EvidenceRetriever(self.pipeline.documents, graph)
+            units = retriever.search(query, top_k=top_k, doc_ids=doc_ids)
+            self.pipeline.metrics.record_evidence(len(units))
+            return json.dumps(
+                {
+                    "query": query,
+                    "units": [u.as_dict() for u in units],
+                    "count": len(units),
+                    "tokens": sum(u.tokens for u in units),
+                    "scopes": ["doc", "repo"] if graph is not None else ["doc"],
                 },
                 indent=2,
             )

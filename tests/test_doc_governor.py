@@ -13,7 +13,11 @@ What is under test:
   reached the prompt) — proving retrieval preserves answerability at a
   fraction of the full-document tokens.
 * Cache interplay: repeating a question is answered with zero upstream tokens.
-* MCP tools doc_ingest / doc_search for agent-side reuse.
+* M5 coverage detection: idf-weighted question/document vocabulary overlap,
+  the abstention caveat, and wire-level disclosure (optimizer block, receipt,
+  metrics) — measured on labeled synthetic pairs.
+* MCP tools doc_ingest / doc_search / evidence for agent-side reuse; the
+  HTTP POST /v1/evidence endpoint (docs-only over unauthenticated HTTP).
 """
 import json
 import unittest
@@ -23,6 +27,7 @@ from urllib.request import Request, urlopen
 
 from tokan.cdm import estimate_tokens
 from tokan.doc import (
+    LOW_COVERAGE,
     Document,
     DocumentStore,
     assemble_messages,
@@ -599,6 +604,175 @@ class TestDocGovernorEndToEnd(unittest.TestCase):
 
         _run(Up, fn=fn)
 
+    def test_low_coverage_ask_is_disclosed_end_to_end(self):
+        Up = _oracle_upstream()
+
+        def fn(gw, base):
+            doc_id = self._ingest(base)["doc_id"]
+            status, _, ans = _post(f"{base}/doc/ask", {
+                "doc_id": doc_id,
+                "question": "How does quantum entanglement work?",
+                "model": "m",
+            })
+            self.assertEqual(status, 200)
+            opt = ans["optimizer"]
+            self.assertLess(opt["coverage"], LOW_COVERAGE)
+            self.assertTrue(opt["low_coverage"])
+            # the upstream prompt carried the strengthened abstention instruction
+            self.assertIn("NOTE: this document appears not to cover",
+                          json.dumps(Up.state["bodies"][-1]))
+            # receipt + metrics disclose the quality flag
+            rec = gw.receipts[-1]
+            self.assertLess(rec["coverage"], LOW_COVERAGE)
+            self.assertTrue(rec["low_coverage"])
+            m = gw.pipeline.metrics.as_dict()
+            self.assertEqual(m["doc_low_coverage"], 1)
+
+        _run(Up, fn=fn)
+
+    def test_healthy_ask_discloses_coverage_without_prompt_change(self):
+        Up = _oracle_upstream()
+
+        def fn(gw, base):
+            doc_id = self._ingest(base)["doc_id"]
+            _, _, ans = _post(f"{base}/doc/ask", {
+                "doc_id": doc_id, "question": _question("liability"), "model": "m",
+            })
+            opt = ans["optimizer"]
+            self.assertGreaterEqual(opt["coverage"], LOW_COVERAGE)
+            self.assertFalse(opt["low_coverage"])
+            self.assertNotIn("NOTE: this document appears not to cover",
+                             json.dumps(Up.state["bodies"][-1]))
+            m = gw.pipeline.metrics.as_dict()
+            self.assertEqual(m["doc_low_coverage"], 0)
+            self.assertEqual(m["doc_questions"], 1)
+
+        _run(Up, fn=fn)
+
+
+class TestEvidenceEndpoint(unittest.TestCase):
+    """POST /v1/evidence — docs-only over unauthenticated HTTP (M5 boundary)."""
+
+    def test_evidence_returns_ranked_doc_units(self):
+        Up = _oracle_upstream()
+
+        def fn(gw, base):
+            _post(f"{base}/ingest", {"text": _contract(), "doc_id": "d_c"})
+            status, _, body = _post(f"{base}/evidence", {"query": _question("termination")})
+            self.assertEqual(status, 200)
+            self.assertGreater(body["count"], 0)
+            self.assertEqual(body["scopes"], ["doc"])
+            top = body["units"][0]
+            self.assertEqual(top["source"], "doc")
+            self.assertIn("d_c", top["key"])
+            self.assertIn("terminate", top["text"])
+            self.assertGreater(top["tokens"], 0)
+            self.assertEqual(body["tokens"], sum(u["tokens"] for u in body["units"]))
+            m = gw.pipeline.metrics.as_dict()
+            self.assertEqual(m["evidence_searches"], 1)
+            self.assertEqual(m["evidence_units"], body["count"])
+
+        _run(Up, fn=fn)
+
+    def test_evidence_errors_are_explicit(self):
+        Up = _oracle_upstream()
+
+        def fn(gw, base):
+            cases = [({}, "query"), ({"query": "q", "doc_ids": "x"}, "doc_ids")]
+            for payload, needle in cases:
+                status, body = _post_status(f"{base}/evidence", payload)
+                self.assertEqual(status, 400)
+                self.assertIn(needle, body["error"]["message"])
+            self.assertEqual(Up.state["calls"], 0)
+
+        _run(Up, fn=fn)
+
+    def test_evidence_serves_empty_when_no_docs(self):
+        Up = _oracle_upstream()
+
+        def fn(gw, base):
+            status, _, body = _post(f"{base}/evidence", {"query": "termination"})
+            self.assertEqual(status, 200)
+            self.assertEqual(body["count"], 0)
+            self.assertEqual(body["units"], [])
+
+        _run(Up, fn=fn)
+
+
+# --------------------------------------------------------------------- MCP
+class TestCoverageDetection(unittest.TestCase):
+    """M5: how much of a question's weighted vocabulary a document contains."""
+
+    def setUp(self):
+        self.store = DocumentStore()
+        self.doc = self.store.ingest(_contract(), doc_id="d_contract")
+
+    def test_in_document_question_scores_high(self):
+        for keyword in FACTS:
+            self.assertGreaterEqual(
+                self.doc.coverage(_question(keyword)),
+                LOW_COVERAGE,
+                f"answerable question flagged low: {keyword}",
+            )
+
+    def test_absent_topic_scores_near_zero(self):
+        absent = [
+            "How does quantum entanglement work?",
+            "What is the capital of France?",
+            "How do I configure Kubernetes autoscaling?",
+            "Which planet has the most moons?",
+            "How does gradient descent converge?",
+            "When was the Eiffel Tower built?",
+            "What React hooks should I use?",
+            "Show me the AWS pricing tiers.",
+        ]
+        for question in absent:
+            self.assertLess(
+                self.doc.coverage(question), LOW_COVERAGE,
+                f"off-topic question not flagged: {question}",
+            )
+
+    def test_flagged_question_strengthens_abstention_not_the_normal_prompt(self):
+        normal, _, _ = assemble_messages(self.doc, _question("liability"))
+        off_topic, _, _ = assemble_messages(self.doc, "How does quantum entanglement work?")
+        self.assertEqual(
+            normal[0]["content"],
+            "Answer the user's question using ONLY the document excerpts below. "
+            "Quote the relevant text when it helps. If the answer is not present "
+            "in the excerpts, say you cannot find it in the provided document.",
+        )
+        self.assertNotIn("NOTE", normal[0]["content"])
+        self.assertIn("NOTE: this document appears not to cover", off_topic[0]["content"])
+
+    def test_empty_document_scores_zero(self):
+        # ingest() rejects blank text, so emulate an unhelpful tiny document.
+        doc = DocumentStore().ingest("placeholder", doc_id="d_tiny")
+        self.assertLess(doc.coverage("termination clause governing law"), LOW_COVERAGE)
+
+    def test_labeled_fixture_detection_counts(self):
+        """Measured on labeled synthetic pairs — reported, not tuned here.
+
+        8 answerable questions (gold facts in the doc) vs 8 off-topic ones.
+        The threshold LOW_COVERAGE was set a priori (0.35, see doc.py); this
+        test asserts a stability bar (>=7/8 each way) and the honest counts
+        are visible in the assertion message.
+        """
+        absent = [
+            "How does quantum entanglement work?",
+            "What is the capital of France?",
+            "How do I configure Kubernetes autoscaling?",
+            "Which planet has the most moons?",
+            "How does gradient descent converge?",
+            "When was the Eiffel Tower built?",
+            "What React hooks should I use?",
+            "Show me the AWS pricing tiers.",
+        ]
+        present = [_question(k) for k in FACTS]
+        flagged_absent = sum(self.doc.is_low_coverage(q) for q in absent)
+        flagged_present = sum(self.doc.is_low_coverage(q) for q in present)
+        self.assertGreaterEqual(flagged_absent, 7, f"absent flagged {flagged_absent}/8")
+        self.assertLessEqual(flagged_present, 1, f"present flagged {flagged_present}/8")
+
 
 # ------------------------------------------------------------------------ MCP
 class TestDocMcpTools(unittest.TestCase):
@@ -644,6 +818,46 @@ class TestDocMcpTools(unittest.TestCase):
     def test_search_requires_args(self):
         server = MCPServer()
         result, _ = self._call(server, "doc_search", {"doc_id": "x"})
+        self.assertTrue(result["isError"])
+
+    def test_doc_search_discloses_coverage(self):
+        server = MCPServer()
+        _, ingested = self._call(server, "doc_ingest", {"text": _contract()})
+        _, found = self._call(server, "doc_search", {
+            "doc_id": ingested["doc_id"], "query": _question("liability"),
+        })
+        self.assertGreaterEqual(found["coverage"], LOW_COVERAGE)
+        self.assertFalse(found["low_coverage"])
+        _, off = self._call(server, "doc_search", {
+            "doc_id": ingested["doc_id"],
+            "query": "How does quantum entanglement work?",
+        })
+        self.assertLess(off["coverage"], LOW_COVERAGE)
+        self.assertTrue(off["low_coverage"])
+
+    def test_evidence_tool_docs_only_without_root(self):
+        server = MCPServer()
+        self._call(server, "doc_ingest", {"text": _contract(), "doc_id": "d_c"})
+        result, data = self._call(server, "evidence", {"query": _question("audit")})
+        self.assertFalse(result["isError"])
+        self.assertEqual(data["scopes"], ["doc"])
+        self.assertGreater(data["count"], 0)
+        self.assertTrue(all(u["source"] == "doc" for u in data["units"]))
+
+    def test_evidence_tool_with_root_includes_repo_units(self):
+        server = MCPServer()
+        result, data = self._call(server, "evidence", {
+            "query": "ContextGovernor", "root": ".",
+        })
+        self.assertFalse(result["isError"])
+        self.assertIn("repo", data["scopes"])
+        repo_units = [u for u in data["units"] if u["source"] == "repo"]
+        self.assertTrue(repo_units)
+        self.assertIn("tokan/governor.py", repo_units[0]["key"])
+
+    def test_evidence_requires_query(self):
+        server = MCPServer()
+        result, _ = self._call(server, "evidence", {})
         self.assertTrue(result["isError"])
 
 

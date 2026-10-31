@@ -637,6 +637,8 @@ class OptimizationPipeline:
             full_tokens=int(ds.get("full_tokens", 0)),
             sent_tokens=sent_tokens,
             chunks_used=int(ds.get("chunks_used", 0)),
+            low_coverage=bool(ds.get("low_coverage", False)),
+            full_fallback=bool(ds.get("full_fallback", False)),
         )
 
     # --------------------------------------------------------------- helpers

@@ -44,6 +44,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from .cdm import estimate_tokens
 
 __all__ = [
+    "LOW_COVERAGE",
+    "STOP_TERMS",
     "assemble_messages",
     "chunk_text",
     "Document",
@@ -57,6 +59,32 @@ __all__ = [
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 # Lowercase alphanumeric terms — cheap, language-agnostic, deterministic.
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+#: Question/function words that carry no topical meaning. Dropped before
+#: coverage scoring so "what/where/does" can't drown the one term that
+#: actually matters. English-only and deliberately small — a missed stopword
+#: costs a little precision; a wrong *domain* word in the list would silently
+#: hide real evidence.
+STOP_TERMS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "am",
+    "what", "which", "who", "whom", "whose", "where", "when", "why", "how",
+    "do", "does", "did", "has", "have", "had", "will", "would", "shall",
+    "should", "can", "could", "may", "might", "must",
+    "this", "that", "these", "those", "it", "its", "they", "them", "their",
+    "there", "i", "you", "he", "she", "we", "me", "my", "your",
+    "of", "in", "on", "at", "to", "for", "from", "by", "with", "as", "into",
+    "over", "and", "or", "not", "no", "if", "then", "than", "so", "such",
+    "about", "per", "up", "out", "off", "again", "please", "tell", "give",
+    "show", "find", "get", "much", "many", "every", "each", "all", "any",
+    "most", "more", "other", "also", "only", "just",
+})
+
+#: Coverage below this (0..1) means the document cannot speak to most of the
+#: question's weighted vocabulary — the request is flagged as low-coverage so
+#: the caller (and the prompt itself) can prefer honest absence over guessing.
+#: Set a priori: "flag when the doc lacks ~2/3 of the question's idf-weighted
+#: content vocabulary", then validated on labeled fixtures (see docs).
+LOW_COVERAGE = 0.35
 
 #: Gateway defaults (override per DocumentStore via constructor kwargs).
 DEFAULT_CHUNK_CHARS = 1200
@@ -159,12 +187,13 @@ class TfidfIndex:
             norm = math.sqrt(sum(w * w for w in vec.values())) or 1.0
             self.vectors.append({t: w / norm for t, w in vec.items()})
 
-    def search(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[int]:
-        """Chunk indices ranked by cosine similarity (ties broken by position).
+    def search_scored(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[Tuple[int, float]]:
+        """``(chunk index, cosine similarity)`` pairs ranked best-first.
 
-        Only strictly-positive matches are returned — if the query shares no
-        terms with the corpus there is no evidence of relevance, and inventing
-        one would be dishonest.
+        Ties broken by position; only strictly-positive matches are returned —
+        if the query shares no terms with the corpus there is no evidence of
+        relevance, and inventing one would be dishonest. `search` is this list
+        with the scores dropped.
         """
         if not self.vectors:
             return []
@@ -187,7 +216,11 @@ class TfidfIndex:
             if sim > 0.0:
                 scored.append((sim, i))
         scored.sort(key=lambda pair: (-pair[0], pair[1]))
-        return [i for _, i in scored[: max(1, int(top_k))]]
+        return [(i, sim) for sim, i in scored[: max(1, int(top_k))]]
+
+    def search(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[int]:
+        """Chunk indices ranked by cosine similarity (ties broken by position)."""
+        return [i for i, _ in self.search_scored(query, top_k=top_k)]
 
 
 # --------------------------------------------------------------------- summary
@@ -271,6 +304,34 @@ class Document:
     def chunk_count(self) -> int:
         return len(self.chunks)
 
+    def content_terms(self, question: str) -> List[str]:
+        """The question's topical vocabulary (stopwords dropped, fallback kept)."""
+        terms = [t for t in _terms(question) if t not in STOP_TERMS]
+        return terms or [t for t in _terms(question)]
+
+    def coverage(self, question: str) -> float:
+        """How much of the question's weighted vocabulary this document contains.
+
+        Returns 0..1: idf-weighted, so a missing *distinctive* term ("termination")
+        costs far more than a missing common one. Terms absent from the corpus
+        are charged the default idf (what they *would* weigh if present), which
+        is what makes an off-topic question score near 0 while a paraphrase of
+        an in-document question stays near 1. Deterministic and O(question) —
+        no retrieval pass, no LLM.
+        """
+        terms = self.content_terms(question)
+        if not terms:
+            return 0.0
+        default_idf = math.log(1 + max(1, len(self.chunks))) + 1.0
+        numer = sum(self.index.idf.get(t, 0.0) for t in terms)
+        denom = sum(self.index.idf.get(t, default_idf) for t in terms)
+        if denom <= 0:
+            return 0.0
+        return max(0.0, min(1.0, numer / denom))
+
+    def is_low_coverage(self, question: str) -> bool:
+        return self.coverage(question) < LOW_COVERAGE
+
 
 def full_resend_tokens(doc: Document, question: str) -> int:
     """Tokens a naive client spends per question: whole document + question."""
@@ -300,6 +361,16 @@ def assemble_messages(
         "Quote the relevant text when it helps. If the answer is not present "
         "in the excerpts, say you cannot find it in the provided document."
     )
+    if doc.is_low_coverage(question):
+        # Coverage (M5): the question's key terms are largely absent from this
+        # document — strengthen the abstention instruction so the model admits
+        # absence instead of pattern-matching the summary. Deterministic, and
+        # only ever ADDED text: a normal-coverage prompt stays byte-identical.
+        system += (
+            " NOTE: this document appears not to cover this question (its key "
+            "terms are missing). If the excerpts do not answer it, say so "
+            "plainly and do not guess."
+        )
     user = (
         f"Document summary:\n{doc.summary}\n\n"
         f"Excerpts:\n{excerpts}\n\n"
@@ -353,6 +424,11 @@ class DocumentStore:
             if doc is not None:
                 self._docs.move_to_end(doc_id)
             return doc
+
+    def ids(self) -> List[str]:
+        """All stored doc ids in LRU order (oldest first)."""
+        with self._lock:
+            return list(self._docs.keys())
 
     def __len__(self) -> int:
         with self._lock:

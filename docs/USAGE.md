@@ -279,7 +279,7 @@ Key ideas:
 | `--host` | `127.0.0.1` | Bind address. Keep local unless you intend to share on a LAN. |
 | `--port` | `4040` | Bind port. |
 | `--upstream` | `https://api.openai.com/v1` | OpenAI-compatible upstream base URL. |
-| `--api-key` | — | Key for the OpenAI-compatible upstream (also used for `--copilot` token). |
+| `--api-key` | env `TOKAN_UPSTREAM_API_KEY` | Key for the OpenAI-compatible upstream (also used for `--copilot` token). The env default is namespaced on purpose — `OPENAI_API_KEY` is *not* read, so an agent's exported key can't be silently repurposed as the gateway's upstream credential. Explicit flag always wins; useful for secret-manager injection (e.g. Key Vault references) where the key must stay out of argv. |
 | `--anthropic-upstream` | `https://api.anthropic.com` | Anthropic-native upstream. |
 | `--anthropic-api-key` | — | Anthropic key (if fronting real Anthropic). |
 | `--gemini-upstream` | `https://generativelanguage.googleapis.com` | Gemini-native upstream. |
@@ -301,6 +301,12 @@ Key ideas:
 | `--recent-window N` | `6` | Trailing messages treated as the high-value working set the governor protects longest. |
 | `--semantic-cache` | off | **Semantic answer cache**: reuse a near-identical previous answer for self-contained factual questions (paraphrases of "What is CI?"). Conservative + opt-in: edits, file paths, code and imperatives are never cached; answers are scoped per model. Semantic hits are booked as `semantic`, not `cache`, so the exact cache's hit rate stays honest. |
 | `--semantic-threshold 0.97` | `0.97` | Risk threshold for semantic reuse (0.97 = near-paraphrase only). Raise it to be more conservative, lower it with care. |
+| `--api-keys K1,K2` | *(env `TOKAN_API_KEYS`)* | **Inbound auth (M6).** Comma-separated gateway keys. Clients send one as `Authorization: Bearer <key>` **or** `X-Optimizer-Api-Key: <key>` (either is accepted — a BYOK provider credential in `Authorization` is just one candidate, so it can coexist with the real key). Constant-time comparison; `/healthz` stays open for probes; everything else — dashboard and `/metrics` included — 401s without a key. Empty = no inbound auth, which is fine on the default loopback bind. |
+| `--allow-insecure` | off | Acknowledge binding a **non-loopback** host with no keys. Without it (or without `--api-keys`) `serve` refuses to start on e.g. `0.0.0.0` — an open gateway would spend your provider budget and see every prompt. |
+| `--redact-secrets` | off | Replace detected secrets (AWS/GitHub/OpenAI/Anthropic/Google/Slack/Stripe/npm keys, JWTs, private-key blocks — *documented formats only*, no entropy guessing) with `[REDACTED:<type>]` **before** canonicalization, the cache digest and the upstream call. Off = detect-and-disclose: bytes untouched, but findings are reported on receipts (`secrets_detected`), `X-Optimizer-Secrets-*` metrics, the console and the dashboard. Redaction is deterministic: two payloads differing only in secret material share one digest, so cache keys never encode secrets. |
+| `--doc-fallback-full` | off | **Quality gate (M6).** When a doc question scores below the coverage threshold (the document likely cannot answer it), send the **full document** instead of weak excerpts — spends the naive tokens on purpose to protect answer quality. Disclosed as `doc_fallback: "full_doc"` on the receipt and `optimizer` block; counted in `doc_full_fallbacks`. Compaction still applies, so some savings remain, but this ask saves far less than retrieval would. |
+| `--task-router` | off | Classify each request into a routing tier (`tier_0` local / `tier_1` low-cost / `tier_2` frontier) and disclose it: receipt `tier`, `/metrics` → `tiers` + `router_requests`. **Classify-only by default** — no model is ever rewritten on its own. |
+| `--tier1-model MODEL` | — | Opt-in rewrite: `tier_1` requests (formatting, quick fixes) are sent to `MODEL` (e.g. `gpt-4o-mini`). Never defaulted — rewriting the model an agent asked for would break BYOK/plan-gated flows. |
 
 ### Provider recipes
 
@@ -353,6 +359,7 @@ token-optimizer serve --copilot --api-key "$(gh auth token)" \
 | `POST /v1beta/models/<m>:generateContent` (and `:streamGenerateContent`) | Gemini wire |
 | `POST /v1/ingest` | **Doc Governor:** index a document once → `doc_id` |
 | `POST /v1/doc/ask` | **Doc Governor:** ask an ingested document a question |
+| `POST /v1/evidence` | **Evidence retriever:** ranked doc chunks for a query (docs only — repo evidence stays behind MCP/CLI) |
 | `GET /healthz` (alias `/health`) | Liveness probe |
 | `GET /models` (alias `/v1/models`) | Model-list passthrough (for agent pickers) |
 | `GET /metrics` | Machine-readable session + cache metrics (JSON) |
@@ -414,7 +421,9 @@ ordinary `chat.completion` plus a disclosed `optimizer` block:
     "full_doc_tokens": 7866,
     "sent_tokens": 1086,
     "tokens_avoided": 6780,
-    "avoided_pct": 86.2
+    "avoided_pct": 86.2,
+    "coverage": 0.629,
+    "low_coverage": false
   }
 }
 ```
@@ -422,6 +431,13 @@ ordinary `chat.completion` plus a disclosed `optimizer` block:
 - `full_doc_tokens` is the naive baseline (whole document + question);
   `sent_tokens` is what Tokan actually forwarded; the difference is **doc
   tokens avoided** — reported separately from compaction savings.
+- `coverage` (M5) is the idf-weighted fraction of the question's content
+  vocabulary the document contains. Below **0.35** (`low_coverage: true`)
+  the prompt sent upstream carries a strengthened abstention instruction
+  ("this document appears not to cover this topic…") and the console line,
+  receipt, dashboard card and `doc_low_coverage` metric all disclose the
+  flag. The route does **not** change: no fabricated local "cannot find it"
+  answer — the model still decides, with a fair warning.
 - Headers: `X-Optimizer-Doc-Id`, `X-Optimizer-Doc-Avoided-Tokens` (these carry
   the economics for `stream: true` responses too).
 - `question` may also be supplied OpenAI-style as `messages[]` (the last user
@@ -430,6 +446,40 @@ ordinary `chat.completion` plus a disclosed `optimizer` block:
 - Errors are explicit: unknown `doc_id` → **404** (the store is a bounded
   in-memory LRU, per gateway process — re-ingest after a restart); missing
   `question` / `model` / `doc_id` → **400** naming the field.
+
+### Evidence retrieval — `POST /v1/evidence`
+
+One ranked list of evidence units (bounded excerpts with token counts) for a
+question — without calling a model. Useful for "show me what you'd send"
+debugging, or for agents assembling their own prompts:
+
+```bash
+curl -s http://127.0.0.1:4040/v1/evidence \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "What is the cap on liability?", "top_k": 5}'
+```
+
+```json
+{
+  "query": "What is the cap on liability?",
+  "units": [
+    {"source": "doc", "key": "d_9d10a9… • chunk 17/42", "score": 0.61,
+     "tokens": 96, "title": "doc d_9d10a9… • chunk 17/42", "text": "…"}
+  ],
+  "count": 1,
+  "tokens": 96,
+  "scopes": ["doc"],
+  "note": "repo-symbol evidence is served by the MCP 'evidence' tool (and CLI), not over unauthenticated HTTP"
+}
+```
+
+- **Scope boundary:** this endpoint searches **ingested documents only** —
+  unauthenticated HTTP never walks your filesystem. Repo-graph evidence
+  (symbols, references, paths) is available through the MCP `evidence` tool
+  and the CLI, which run with agent-local trust.
+- Scores are store-native (TF-IDF cosine for documents) and labeled per unit;
+  cross-store score calibration is **not** claimed. Optional `doc_ids` list
+  restricts the search.
 
 ---
 
@@ -553,11 +603,16 @@ so agents can call its optimization tools directly.
 |---|---|
 | `optimize_context` | CDM-compact a payload and report tokens saved |
 | `repo_index` | Structural repo map within a byte budget |
+| `repo_graph` | Definitions / references / imports / test-edge graph within a byte budget (`truncated` flag) |
 | `cache_lookup` | Semantic cache probe — "is this context already known?" |
 | `cache_store` | Store a context in the cache |
 | `session_metrics` | Live savings / ROI counters |
 | `doc_ingest` | Index a long document once → `doc_id` + summary |
-| `doc_search` | Summary + top-k excerpts for a question (vs re-reading the file) |
+| `doc_search` | Summary + top-k excerpts for a question (vs re-reading the file) + coverage score |
+| `evidence` | Ranked evidence units across docs **and** the repo graph — pass `root` to include symbol/path evidence |
+
+Doc Q&A tools disclose `coverage` / `low_coverage`: below 0.35 the document
+likely cannot answer the question — look elsewhere rather than guessing.
 
 **Start it manually** (for testing):
 
@@ -595,7 +650,9 @@ An auto-refreshing HTML page showing:
 
 - **Counters:** requests, cache hits, local solves, LLM calls, tokens saved,
   saved %, provider cache, prefix reuse, **Docs / Doc Q&A / Doc avoided**,
-  fallbacks, cache entries, hit rate.
+  fallbacks, cache entries, hit rate; and the M6 tiles **Full-doc fallbacks**,
+  **Secrets found / redacted** and **Auth failures** (all read live from
+  `/metrics`, zero hardcoded values).
 - **A rolling table of recent requests:** time, route, model, tokens in→out,
   saved % (rows from `/v1/doc/ask` carry a `doc` marker — their savings are
   measured against the full-document resend), status, **latency (tokan /
@@ -618,7 +675,13 @@ is Tokan's.
 
 ### Metrics — `http://127.0.0.1:4040/metrics`
 
-Machine-readable JSON (`session` + `cache` counters). Use this for monitoring.
+Machine-readable JSON (`session` + `cache` counters, plus `tiers` from the
+task router). Use this for monitoring.
+
+M6 hardening counters in `session`: `auth_failures` (401s), `secrets_detected`
+/ `secrets_redacted`, `doc_full_fallbacks`, `router_requests` (and the
+per-tier breakdown under the top-level `tiers` key). With inbound auth
+enabled this endpoint itself requires a key.
 
 ### `stats` command
 
@@ -676,6 +739,8 @@ tiles):
 | `doc_tokens_avoided` | `doc_full_tokens − doc_sent_tokens` |
 | `doc_avoided_pct` | avoided ÷ full, in percent |
 | `doc_chunks_used` | retrieved excerpts sent (retrieval quality signal) |
+| `doc_low_coverage` | doc asks whose question outran the document (M5 quality signal — not a saving) |
+| `evidence_searches` / `evidence_units` | `/v1/evidence` + MCP `evidence` calls / units returned (M5) |
 
 These are deliberately **not** mixed into `tokens_saved`: compaction savings
 and retrieval avoidance have different baselines, and one number per baseline
@@ -772,10 +837,24 @@ token-optimizer index .                    # writes ./AGENTS.md (8 KB budget)
 token-optimizer index . --out -            # print to stdout
 token-optimizer index . --max-bytes 20000  # bigger budget
 token-optimizer index . --ignore dist --ignore vendor   # extra ignores
+token-optimizer index . --cache .tokan/index-cache.json # incremental rebuilds
+token-optimizer index . --graph-out graph.json          # dump the repo graph (M5)
 ```
 
 It walks the tree (honoring `.gitignore` + built-in ignores), collects a
 symbol index, and emits a size-bounded Markdown map.
+
+**Incremental builds (`--cache`)** keep a JSON symbol cache keyed by file
+`(mtime, size)`: a warm rebuild re-reads nothing (verified by read-count
+instrumentation) — typically ~2× faster cold-vs-warm on mid-size repos, and
+the gap widens with repo size since only the walk repeats. A corrupt or
+stale cache fails **open**: it's ignored and rebuilt.
+
+**`--graph-out`** additionally computes the M5 `RepoGraph` — definitions,
+whole-word cross-file references, Python import edges and test→source edges —
+and writes it as JSON. The same graph serves the MCP `repo_graph` and
+`evidence` tools. Import resolution is a line-anchored best effort (documented
+heuristics, not an AST): re-exports and dynamic imports are not followed.
 
 ---
 
@@ -913,6 +992,8 @@ token-optimizer <command>
       --out FILE                (default AGENTS.md; '-' = stdout)
       --max-bytes N             (default 8192)
       --ignore PATTERN          Repeatable extra ignore
+      --cache PATH              Incremental symbol cache (relative to root)
+      --graph-out PATH          Also write the repo graph as JSON
 
   stats                         Metrics from a running gateway
       --host HOST               (default 127.0.0.1)

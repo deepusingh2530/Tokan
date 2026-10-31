@@ -7,17 +7,36 @@ function gatewayBase(raw: string): string {
   return (raw || '').replace(/\/+$/, '').replace(/\/v1$/, '');
 }
 
+/**
+ * Inbound-auth headers for gateway endpoints (M6): send the configured key
+ * both ways — X-Optimizer-Api-Key is Tokan's purpose-built header, while
+ * Bearer is the shape agents already speak (and the pattern where a Copilot
+ * OAuth token doubles as the gateway key). The gateway accepts either.
+ */
+function authHeaders(token: string): Record<string, string> {
+  if (!token) {
+    return {};
+  }
+  return {
+    'X-Optimizer-Api-Key': token,
+    'Authorization': `Bearer ${token}`,
+  };
+}
+
 export function activate(context: vscode.ExtensionContext) {
   // 1. Read workspace config and keep it in sync (Tokan keys only — do NOT
   // touch Copilot's deprecated debug.overrideProxyUrl; modern VS Code routes
   // through BYOK Custom Endpoint models in chatLanguageModels.json instead).
   const workspaceFolders = vscode.workspace.workspaceFolders;
+  // tokan.authToken is resource-scoped: read it against the workspace folder
+  // URI, or VS Code returns the default ('') and every poll 401s.
+  const cfgScope = workspaceFolders?.[0]?.uri;
   if (workspaceFolders && workspaceFolders.length > 0) {
     const rootPath = workspaceFolders[0].uri.fsPath;
     const settingsFile = path.join(rootPath, '.vscode', 'settings.json');
     const mcpFile = path.join(rootPath, '.mcp.json');
 
-    const config = vscode.workspace.getConfiguration('tokan');
+    const config = vscode.workspace.getConfiguration('tokan', cfgScope);
     const gatewayUrl = config.get<string>('gatewayUrl', '');
     const authToken = config.get<string>('authToken', '');
 
@@ -35,17 +54,55 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     try {
-      const mcpConfig = {
-        servers: {
-          tokan: {
+      // Merge into the existing file instead of clobbering it: .mcp.json may
+      // be a committed, sanitized example (mcpServers schema) or a user's own
+      // config — rewriting it wholesale would destroy their entries and drop
+      // live credentials into a tracked file. Support both the VS Code
+      // `servers` and the Claude Code `mcpServers` top-level key, and if a
+      // `tokan` entry already exists, leave it alone: once the file exists,
+      // its config belongs to the user/repo, not to this extension.
+      let mcpConfig: any = null;
+      if (fs.existsSync(mcpFile)) {
+        try {
+          mcpConfig = JSON.parse(fs.readFileSync(mcpFile, 'utf8'));
+        } catch {
+          mcpConfig = null; // unreadable JSON: replace with a fresh config
+        }
+      }
+      if (mcpConfig && typeof mcpConfig === 'object') {
+        const rootKey = mcpConfig['mcpServers'] && !mcpConfig['servers']
+          ? 'mcpServers' : 'servers';
+        const existing = mcpConfig[rootKey];
+        const hasTokan = !!(existing && typeof existing === 'object'
+                            && existing['tokan']);
+        if (!hasTokan) {
+          // No tokan entry yet: add ours alongside whatever else lives here.
+          if (!existing || typeof existing !== 'object') {
+            mcpConfig[rootKey] = {};
+          }
+          mcpConfig[rootKey]['tokan'] = {
             command: 'python',
             args: ['-m', 'tokan.mcp'],
             url: gatewayBase(gatewayUrl) + '/v1/mcp',
             env: authToken ? { TOKAN_AUTH_TOKEN: authToken } : {}
-          }
+          };
+          fs.writeFileSync(mcpFile,
+                           JSON.stringify(mcpConfig, null, 2) + '\n');
         }
-      };
-      fs.writeFileSync(mcpFile, JSON.stringify(mcpConfig, null, 2));
+        // Pre-existing tokan entry: leave it alone — once the file exists,
+        // its config belongs to the user/repo, not to this extension.
+      } else {
+        fs.writeFileSync(mcpFile, JSON.stringify({
+          servers: {
+            tokan: {
+              command: 'python',
+              args: ['-m', 'tokan.mcp'],
+              url: gatewayBase(gatewayUrl) + '/v1/mcp',
+              env: authToken ? { TOKAN_AUTH_TOKEN: authToken } : {}
+            }
+          }
+        }, null, 2) + '\n');
+      }
     } catch (e) {
       console.error('Failed to write .mcp.json:', e);
     }
@@ -64,7 +121,9 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     inflight = true;
-    const gatewayUrl = vscode.workspace.getConfiguration('tokan').get<string>('gatewayUrl', '');
+    const cfg = vscode.workspace.getConfiguration('tokan', cfgScope);
+    const gatewayUrl = cfg.get<string>('gatewayUrl', '');
+    const authToken = cfg.get<string>('authToken', '');
     const metricsUrl = gatewayBase(gatewayUrl) + '/metrics';
     if (!metricsUrl.startsWith('http')) {
       statusBar.text = '$(zap) Tokan: no gateway';
@@ -73,9 +132,13 @@ export function activate(context: vscode.ExtensionContext) {
       return;
     }
     try {
-      const res = await fetch(metricsUrl, { signal: AbortSignal.timeout(4000) });
+      // M6: /metrics requires a key when the gateway runs with --api-keys.
+      const res = await fetch(metricsUrl, {
+        signal: AbortSignal.timeout(4000),
+        headers: authHeaders(authToken),
+      });
       if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
+        throw new Error(`HTTP ${res.status}${res.status === 401 ? ' (set tokan.authToken)' : ''}`);
       }
       const data: any = await res.json();
       const s = data.session || {};
@@ -87,6 +150,8 @@ export function activate(context: vscode.ExtensionContext) {
         `Token savings: ${saved.toFixed(1)}% (${s.tokens_saved ?? 0} tok)`,
         `Requests: ${requests}  (cache ${cacheHits}, local ${s.local_solves ?? 0}, llm ${s.llm_calls ?? 0})`,
         `Cost saved: $${Number(s.cost_saved_usd ?? 0).toFixed(4)}`,
+        ...(Number(s.secrets_redacted ?? 0) > 0 ? [`Secrets redacted: ${s.secrets_redacted} (of ${s.secrets_detected} found)`] : []),
+        ...(Number(s.auth_failures ?? 0) > 0 ? [`Auth failures: ${s.auth_failures}`] : []),
         '',
         'Click to open the full dashboard',
       ].join('\n');
@@ -104,26 +169,80 @@ export function activate(context: vscode.ExtensionContext) {
 
   // 3. Command: Export Terminal Environment
   const terminalEnvCmd = vscode.commands.registerCommand('tokan.exportTerminalEnv', () => {
-    const gatewayUrl = vscode.workspace.getConfiguration('tokan').get<string>('gatewayUrl', '');
+    const cfg = vscode.workspace.getConfiguration('tokan', cfgScope);
+    const gatewayUrl = cfg.get<string>('gatewayUrl', '');
+    const authToken = cfg.get<string>('authToken', '');
     const base = gatewayBase(gatewayUrl);
     vscode.window.showInformationMessage(`Tokan environment set: OPENAI_BASE_URL=${base}/v1`);
     const terminal = vscode.window.createTerminal({ name: 'Tokan Env' });
     terminal.sendText(`export OPENAI_BASE_URL=${base}/v1`);
     terminal.sendText(`export ANTHROPIC_BASE_URL=${base}/v1/messages`);
+    if (authToken) {
+      // M6 gateway auth: terminal agents authenticate to the gateway with the
+      // same Bearer they'd use for a provider. When the gateway holds its own
+      // upstream key it swaps it in; in BYOK passthrough this is the provider
+      // token doubling as the gateway key (the Copilot OAuth pattern).
+      terminal.sendText(`export OPENAI_API_KEY='${authToken.replace(/'/g, "'\\''")}'`);
+      terminal.sendText(`export ANTHROPIC_API_KEY='${authToken.replace(/'/g, "'\\''")}'`);
+      terminal.sendText('export TOKAN_API_KEY="$OPENAI_API_KEY"');
+    }
     terminal.show();
   });
 
   // 4. Command: open the live dashboard directly in the browser.
-  const showMetricsCmd = vscode.commands.registerCommand('tokan.showMetrics', () => {
-    const gatewayUrl = vscode.workspace.getConfiguration('tokan').get<string>('gatewayUrl', '');
-    const dashUrl = gatewayBase(gatewayUrl) + '/dashboard';
-    if (dashUrl.startsWith('http')) {
-      void vscode.env.openExternal(vscode.Uri.parse(dashUrl));
-    } else {
+  //    The dashboard requires a key when the gateway runs with --api-keys and
+  //    browsers cannot set headers on a top-level navigation — so with a token
+  //    configured we render authenticated /metrics in an editor tab instead
+  //    (same numbers as the dashboard, no key in the URL).
+  const showMetricsCmd = vscode.commands.registerCommand('tokan.showMetrics', async () => {
+    const cfg = vscode.workspace.getConfiguration('tokan', cfgScope);
+    const gatewayUrl = cfg.get<string>('gatewayUrl', '');
+    const authToken = cfg.get<string>('authToken', '');
+    const base = gatewayBase(gatewayUrl);
+    if (!base.startsWith('http')) {
       vscode.window.showWarningMessage(
         'Tokan: set tokan.gatewayUrl in settings to open the dashboard.'
       );
+      return;
     }
+    if (authToken) {
+      try {
+        const res = await fetch(base + '/metrics', {
+          signal: AbortSignal.timeout(4000),
+          headers: authHeaders(authToken),
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const data: any = await res.json();
+        const s = data.session || {};
+        const lines = [
+          'Tokan gateway metrics', '='.repeat(40),
+          `requests        : ${s.requests ?? 0}`,
+          `saved           : ${s.saved_pct ?? 0}% (${s.tokens_saved ?? 0} tok)`,
+          `cache hits      : ${data.cache?.hits ?? 0} / ${data.cache?.misses ?? 0} (miss/hit)`,
+          `semantic hits   : ${s.semantic_cache_hits ?? 0}`,
+          `cost saved      : $${Number(s.cost_saved_usd ?? 0).toFixed(4)}`,
+          `auth failures   : ${s.auth_failures ?? 0}`,
+          `secrets found   : ${s.secrets_detected ?? 0} (redacted ${s.secrets_redacted ?? 0})`,
+          `doc fallbacks   : ${s.doc_full_fallbacks ?? 0}  low coverage: ${s.doc_low_coverage ?? 0}`,
+          `router tiers    : ${JSON.stringify(data.tiers ?? {})}`,
+          '',
+          `Full dashboard (key required): ${base}/dashboard`,
+        ];
+        const doc = await vscode.workspace.openTextDocument({
+          language: 'markdown',
+          content: '```\n' + lines.join('\n') + '\n```',
+        });
+        await vscode.window.showTextDocument(doc, { preview: false });
+      } catch (e) {
+        vscode.window.showErrorMessage(
+          `Tokan: metrics fetch failed (${e instanceof Error ? e.message : e}) — check tokan.gatewayUrl / tokan.authToken`
+        );
+      }
+      return;
+    }
+    void vscode.env.openExternal(vscode.Uri.parse(base + '/dashboard'));
   });
 
   context.subscriptions.push(
