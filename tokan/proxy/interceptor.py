@@ -33,10 +33,11 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from ..cdm import estimate_tokens
 from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
+from ..memory import ContextManifest, ConversationStore, content_digest
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
 from ..session import SESSION_HEADER
 
@@ -159,6 +160,9 @@ class ProxyConfig:
     prompt_cache_key: bool = False
     #: How many receipts the /dashboard keeps in its rolling window.
     receipt_window: int = 500
+    #: Optional SQLite file for the append-only conversation store
+    #: (observe-only memory: records events + manifests, never serves them).
+    conversation_db: Optional[str] = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -214,6 +218,8 @@ class _Handler(BaseHTTPRequestHandler):
         upstream_ms: float = 0.0,
         upstream_cached: int = 0,
         fallback: str = "",
+        protocol: str = "openai",
+        response_text: str = "",
     ) -> None:
         """One line of truth per request: route, tokens, latency, disclosures.
 
@@ -262,6 +268,13 @@ class _Handler(BaseHTTPRequestHandler):
             "doc_id": ds.get("doc_id", "") if ds else "",
             "fallback": fallback,
         }
+        # Conversation memory: a request id ties receipt, manifest and events
+        # together. Only added when the store is on, so flag-off receipts stay
+        # byte-identical to prior releases.
+        if self.store is not None:
+            rec["rid"] = hashlib.sha256(
+                f"{rec['ts']}|{rec['digest']}|{self.path}".encode("utf-8")
+            ).hexdigest()[:16]
         self.receipts.append(rec)
         if self.config.log_requests:
             line = (
@@ -318,6 +331,98 @@ class _Handler(BaseHTTPRequestHandler):
                 if not isinstance(c, str):
                     c = json.dumps(c, ensure_ascii=False, default=str)
                 print(f"    m[{i}] {m.get('role', '?')} len={len(c)} sha={hashlib.sha1(c.encode('utf-8')).hexdigest()[:6]} head={c[:80]!r} tail={c[-60:]!r}", flush=True)
+        self._observe(
+            payload, result, route=route, status=status, protocol=protocol,
+            rid=rec.get("rid", ""), response_text=response_text,
+        )
+
+    # ------------------------------------------------------------- observer
+    def _observe(
+        self,
+        payload: Dict[str, Any],
+        result: PipelineResult,
+        *,
+        route: str,
+        status: int,
+        protocol: str,
+        rid: str,
+        response_text: str = "",
+    ) -> None:
+        """Observe-only conversation memory (design principle: recoverability).
+
+        Appends the request's newest message (extracted from the *original*
+        payload — the store keeps real bytes, not the digest-scrubbed view),
+        the assistant's answer when known, and a context manifest. Never alters
+        the request or response; every failure is swallowed so storage can
+        never affect serving.
+
+        Resend dedupe: agent clients re-send the whole history each turn, so a
+        request whose last message equals the stored last message event appends
+        nothing new — only genuinely new turns are recorded.
+        """
+        store = self.store
+        if store is None:
+            return
+        try:
+            conv = (
+                (self.headers.get(SESSION_HEADER) or "").strip()
+                or (result.prefix_reuse.session_key if result.prefix_reuse else "")
+            )
+            if not conv:
+                return
+            last = _last_payload_message(payload, protocol)
+            if last is not None:
+                role, text = last
+                content = {"role": role, "text": text}
+                # Dedupe against the last message event *of the same role*:
+                # agent clients re-send whole histories, so a verbatim retry
+                # (or a cache-hit re-serve of the same turn) records nothing
+                # new, while genuinely new turns do. The digest basis MUST be
+                # memory.content_digest — the store's canonical JSON encoding.
+                prev = store.last_message(conv, source=role)
+                if prev is None or prev.digest != content_digest(content):
+                    store.append(conv, source=role, kind="message", content=content)
+            if response_text:
+                answer_content = {"text": response_text}
+                prev_answer = store.last_message(conv, source="assistant")
+                if prev_answer is None or prev_answer.digest != content_digest(answer_content):
+                    store.append(
+                        conv, source="assistant", kind="message", content=answer_content
+                    )
+            manifest = ContextManifest(
+                rid=rid,
+                conversation=conv,
+                ts=time.time(),
+                protocol=protocol,
+                route=route,
+                status=status,
+                model=str(payload.get("model", "")),
+                digest=result.record.digest[:16],
+                original_tokens=result.record.original_tokens,
+                optimized_tokens=(
+                    0 if route in ("cache", "local") else result.record.canonical_tokens
+                ),
+                cache_hit=bool(result.cached),
+                volatile_scrubbed=int(result.volatile_scrubbed),
+                prefix_reused=(
+                    result.prefix_reuse.reused_tokens if result.prefix_reuse else 0
+                ),
+                protected={
+                    "system_messages": sum(
+                        1 for m in result.messages if m.get("role") == "system"
+                    )
+                },
+                included={"messages": len(result.messages)},
+                compressed=(
+                    {"devolatilized": int(result.volatile_scrubbed)}
+                    if result.volatile_scrubbed
+                    else {}
+                ),
+            )
+            store.append(conv, source="optimization", kind="manifest", content=manifest.as_dict())
+        except Exception as exc:  # fail open — memory is never in the hot path
+            if self.config.log_requests:
+                print(f"[tokan] conversation observer skipped: {exc}", flush=True)
 
     # ---------------------------------------------------------------- routes
     def do_GET(self) -> None:  # noqa: N802
@@ -501,6 +606,11 @@ class _Handler(BaseHTTPRequestHandler):
                 route=result.decision.route, status=200,
                 ms=(time.perf_counter() - started) * 1000,
                 upstream_ms=0.0,
+                protocol=protocol,
+                response_text=(
+                    result.local_answer
+                    or (result.cached_value if isinstance(result.cached_value, str) else "")
+                ),
             )
             return
 
@@ -1010,6 +1120,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
             )
             return
 
@@ -1018,7 +1129,7 @@ class _Handler(BaseHTTPRequestHandler):
             extra["X-Optimizer-Fallback"] = fallback_note
 
         if payload.get("stream") or endpoint == "generate_content_stream":
-            self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
+            streamed = self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
             # Streaming: the relay loop IS the generation, so it's all upstream.
             upstream_ms = (time.perf_counter() - upstream_start) * 1000
             self._record_receipt(
@@ -1026,6 +1137,8 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
+                response_text=streamed,
             )
             return
 
@@ -1041,6 +1154,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
             )
             return
 
@@ -1058,12 +1172,15 @@ class _Handler(BaseHTTPRequestHandler):
             ms=(time.perf_counter() - started) * 1000 if started else 0.0,
             upstream_ms=upstream_ms,
             upstream_cached=cached, fallback=fallback_note,
+            protocol=protocol,
+            response_text=self.pipeline._extract_content(parsed, protocol=protocol) or "",
         )
 
     def _relay_stream(
         self, upstream_resp: Any, result: PipelineResult, *, protocol: str = "openai",
         extra: Optional[Dict[str, str]] = None,
-    ) -> None:
+    ) -> str:
+        """Relay the SSE stream; return the buffered answer text (may be "")."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         for key, value in {**self._route_headers(result), **(extra or {})}.items():
@@ -1124,6 +1241,58 @@ class _Handler(BaseHTTPRequestHandler):
             answer = _extract_streamed_text(buffered, protocol)
             if answer:
                 self.pipeline.cache.set(result.cache_key, answer)
+        return answer
+
+
+def _last_payload_message(payload: Dict[str, Any], protocol: str) -> Optional[Tuple[str, str]]:
+    """Newest (role, text) from the *original* wire payload, any protocol.
+
+    The conversation store keeps original bytes — never the digest-scrubbed
+    view the cache sees. Returns None when the payload carries no message
+    text at all.
+    """
+    def _parts_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            bits = []
+            for part in content:
+                if isinstance(part, dict):
+                    for key in ("text", "content"):
+                        val = part.get(key)
+                        if isinstance(val, str):
+                            bits.append(val)
+                            break
+            return "\n".join(bits)
+        return ""
+
+    items: Sequence[Any] = []
+    if protocol == "gemini":
+        items = payload.get("contents") or []
+    elif protocol == "anthropic":
+        items = payload.get("messages") or []
+    elif isinstance(payload.get("input"), list):  # openai responses
+        items = payload["input"]
+    else:  # openai chat
+        items = payload.get("messages") or []
+    for item in reversed(list(items)):
+        if not isinstance(item, dict):
+            continue
+        if protocol == "gemini":
+            role = item.get("role", "user")
+            text = "\n".join(
+                str(p.get("text", "")) for p in item.get("parts") or [] if isinstance(p, dict)
+            )
+        elif isinstance(item.get("type"), str) and item.get("type") == "message":
+            # Responses input item: {"type": "message", "role": ..., "content": [...]}
+            role = str(item.get("role", "user"))
+            text = _parts_text(item.get("content"))
+        else:
+            role = str(item.get("role", ""))
+            text = _parts_text(item.get("content"))
+        if text:
+            return (role or "user"), text
+    return None
 
 
 def _is_model_rejection(status: int, detail: str) -> bool:
@@ -1258,6 +1427,14 @@ class TokenOptimizerProxy:
         self.pipeline = pipeline or OptimizationPipeline.with_cdn()
         # Rolling per-request receipts, shared across handler instances.
         self.receipts: Deque[Dict[str, Any]] = deque(maxlen=self.config.receipt_window)
+        # Conversation memory (observe-only): a misconfigured store must never
+        # take the gateway down — warn once and serve on.
+        self.store: Optional[ConversationStore] = None
+        if self.config.conversation_db:
+            try:
+                self.store = ConversationStore(self.config.conversation_db)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[tokan] conversation store unavailable ({exc}); serving without", flush=True)
 
         outer = self
 
@@ -1265,6 +1442,7 @@ class TokenOptimizerProxy:
             pipeline = outer.pipeline
             config = outer.config
             receipts = outer.receipts
+            store = outer.store
 
         self._server = _GatewayServer((self.config.host, self.config.port), Handler)
         self._thread: Optional[threading.Thread] = None
@@ -1324,6 +1502,8 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--cache-db", default=None, help="sqlite file for a persistent edge cache")
     parser.add_argument("--fallback-model", default=None, help="retry once with this model on model_not_supported")
     parser.add_argument("--log-requests", action="store_true", help="print one receipt line per request")
+    parser.add_argument("--conversation-db", default=None,
+                        help="sqlite file for the append-only conversation store (observe-only)")
     args = parser.parse_args(argv)
     try:
         upstream, extra_headers, fallback_headers = resolve_upstream_flags(args)
@@ -1348,6 +1528,7 @@ def main(argv: Optional[list] = None) -> None:
             fallback_headers=fallback_headers,
             fallback_model=args.fallback_model,
             log_requests=args.log_requests,
+            conversation_db=args.conversation_db,
         ),
         pipeline,
     )

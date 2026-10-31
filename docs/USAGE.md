@@ -294,6 +294,7 @@ Key ideas:
 | `--fallback-model MODEL` | — | Retry once with this model when upstream rejects the requested one (`model_not_supported` / `model_not_found`). |
 | `--log-requests` | off | Print one **receipt line** per request to the console. |
 | `--prompt-cache-key` | off | Inject a stable `prompt_cache_key` (the session id) into OpenAI-wire payloads so the provider routes the conversation to one prompt cache. Provider support varies; off by default. |
+| `--conversation-db PATH` | — | SQLite file for the **append-only conversation store** (observe-only memory: records message events + context manifests per turn, never serves them). Storage failures fail open — the gateway serves on regardless. |
 
 ### Provider recipes
 
