@@ -23,6 +23,7 @@ Stdlib only — no third-party dependencies required to run the gateway.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import threading
@@ -32,10 +33,11 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from ..cdm import estimate_tokens
 from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
+from ..memory import ContextManifest, ConversationStore, content_digest
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
 from ..session import SESSION_HEADER
 
@@ -158,6 +160,9 @@ class ProxyConfig:
     prompt_cache_key: bool = False
     #: How many receipts the /dashboard keeps in its rolling window.
     receipt_window: int = 500
+    #: Optional SQLite file for the append-only conversation store
+    #: (observe-only memory: records events + manifests, never serves them).
+    conversation_db: Optional[str] = None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -213,6 +218,8 @@ class _Handler(BaseHTTPRequestHandler):
         upstream_ms: float = 0.0,
         upstream_cached: int = 0,
         fallback: str = "",
+        protocol: str = "openai",
+        response_text: str = "",
     ) -> None:
         """One line of truth per request: route, tokens, latency, disclosures.
 
@@ -261,6 +268,13 @@ class _Handler(BaseHTTPRequestHandler):
             "doc_id": ds.get("doc_id", "") if ds else "",
             "fallback": fallback,
         }
+        # Conversation memory: a request id ties receipt, manifest and events
+        # together. Only added when the store is on, so flag-off receipts stay
+        # byte-identical to prior releases.
+        if self.store is not None:
+            rec["rid"] = hashlib.sha256(
+                f"{rec['ts']}|{rec['digest']}|{self.path}".encode("utf-8")
+            ).hexdigest()[:16]
         self.receipts.append(rec)
         if self.config.log_requests:
             line = (
@@ -278,7 +292,137 @@ class _Handler(BaseHTTPRequestHandler):
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
                 line += f" fallback={fallback}"
+            # Cache-miss diagnosis: which conversation part changed the digest.
+            # Two "identical" asks that log different part hashes (or different
+            # scope values) are genuinely different canonical payloads.
+            parts = ",".join(
+                hashlib.sha1(
+                    json.dumps(m, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                ).hexdigest()[:6]
+                for m in result.messages
+            )
+            scope_bits = "".join(
+                f" {k}={str(payload[k])[:32]}" for k in ("user", "temperature", "top_p") if payload.get(k) is not None
+            )
+            line += f" digest={rec['digest']} parts=[{parts}]{scope_bits}"
+            if result.volatile_scrubbed:
+                line += f" devol={result.volatile_scrubbed}"
+            # Log-only conversation preview (truncated): shows what each
+            # canonical message actually says — the fastest way to spot a
+            # client injecting per-thread noise. Never exposed on the wire.
+            prev = []
+            for i, m in enumerate(result.messages[:12]):
+                c = m.get("content")
+                if not isinstance(c, str):
+                    c = json.dumps(c, ensure_ascii=False, default=str)
+                if i < 3 and len(c) > 120:
+                    # Leading messages carry client-injected preambles; show
+                    # head+tail so per-thread volatile ids are visible.
+                    prev.append(f"{m.get('role', '?')}:{c[:160]}…{c[-80:]}")
+                else:
+                    prev.append(f"{m.get('role', '?')}:{c[:40]}")
+            line += f" convo=[{' | '.join(prev)}{' ...' if len(result.messages) > 12 else ''}]"
             print(line, flush=True)
+            # One line per message (own log line, so Azure's per-line cap can't
+            # hide the middle of the payload): role, length, sha and head.
+            # This is how client-injected per-thread noise gets identified.
+            for i, m in enumerate(result.messages[:16]):
+                c = m.get("content")
+                if not isinstance(c, str):
+                    c = json.dumps(c, ensure_ascii=False, default=str)
+                print(f"    m[{i}] {m.get('role', '?')} len={len(c)} sha={hashlib.sha1(c.encode('utf-8')).hexdigest()[:6]} head={c[:80]!r} tail={c[-60:]!r}", flush=True)
+        self._observe(
+            payload, result, route=route, status=status, protocol=protocol,
+            rid=rec.get("rid", ""), response_text=response_text,
+        )
+
+    # ------------------------------------------------------------- observer
+    def _observe(
+        self,
+        payload: Dict[str, Any],
+        result: PipelineResult,
+        *,
+        route: str,
+        status: int,
+        protocol: str,
+        rid: str,
+        response_text: str = "",
+    ) -> None:
+        """Observe-only conversation memory (design principle: recoverability).
+
+        Appends the request's newest message (extracted from the *original*
+        payload — the store keeps real bytes, not the digest-scrubbed view),
+        the assistant's answer when known, and a context manifest. Never alters
+        the request or response; every failure is swallowed so storage can
+        never affect serving.
+
+        Resend dedupe: agent clients re-send the whole history each turn, so a
+        request whose last message equals the stored last message event appends
+        nothing new — only genuinely new turns are recorded.
+        """
+        store = self.store
+        if store is None:
+            return
+        try:
+            conv = (
+                (self.headers.get(SESSION_HEADER) or "").strip()
+                or (result.prefix_reuse.session_key if result.prefix_reuse else "")
+            )
+            if not conv:
+                return
+            last = _last_payload_message(payload, protocol)
+            if last is not None:
+                role, text = last
+                content = {"role": role, "text": text}
+                # Dedupe against the last message event *of the same role*:
+                # agent clients re-send whole histories, so a verbatim retry
+                # (or a cache-hit re-serve of the same turn) records nothing
+                # new, while genuinely new turns do. The digest basis MUST be
+                # memory.content_digest — the store's canonical JSON encoding.
+                prev = store.last_message(conv, source=role)
+                if prev is None or prev.digest != content_digest(content):
+                    store.append(conv, source=role, kind="message", content=content)
+            if response_text:
+                answer_content = {"text": response_text}
+                prev_answer = store.last_message(conv, source="assistant")
+                if prev_answer is None or prev_answer.digest != content_digest(answer_content):
+                    store.append(
+                        conv, source="assistant", kind="message", content=answer_content
+                    )
+            manifest = ContextManifest(
+                rid=rid,
+                conversation=conv,
+                ts=time.time(),
+                protocol=protocol,
+                route=route,
+                status=status,
+                model=str(payload.get("model", "")),
+                digest=result.record.digest[:16],
+                original_tokens=result.record.original_tokens,
+                optimized_tokens=(
+                    0 if route in ("cache", "local") else result.record.canonical_tokens
+                ),
+                cache_hit=bool(result.cached),
+                volatile_scrubbed=int(result.volatile_scrubbed),
+                prefix_reused=(
+                    result.prefix_reuse.reused_tokens if result.prefix_reuse else 0
+                ),
+                protected={
+                    "system_messages": sum(
+                        1 for m in result.messages if m.get("role") == "system"
+                    )
+                },
+                included={"messages": len(result.messages)},
+                compressed=(
+                    {"devolatilized": int(result.volatile_scrubbed)}
+                    if result.volatile_scrubbed
+                    else {}
+                ),
+            )
+            store.append(conv, source="optimization", kind="manifest", content=manifest.as_dict())
+        except Exception as exc:  # fail open — memory is never in the hot path
+            if self.config.log_requests:
+                print(f"[tokan] conversation observer skipped: {exc}", flush=True)
 
     # ---------------------------------------------------------------- routes
     def do_GET(self) -> None:  # noqa: N802
@@ -295,6 +439,10 @@ class _Handler(BaseHTTPRequestHandler):
                     "cache": self.pipeline.cache.stats(),
                 },
             )
+        elif self.path in ("/receipts", "/v1/receipts"):
+            # Rolling receipt window as JSON — the same rows the dashboard
+            # renders, for tooling and cache-miss diagnosis.
+            self._send_json(200, {"receipts": list(self.receipts)})
         elif self.path in ("/dashboard", "/v1/dashboard"):
             self._dashboard()
         else:
@@ -433,9 +581,11 @@ class _Handler(BaseHTTPRequestHandler):
             result.doc_savings = doc_savings
 
         # 1) Cache hit / deterministic local answer: zero upstream tokens.
+        # Every wire gets its own response shape — including Responses API.
         if result.can_serve_locally:
             response = self.pipeline.serve_local(
-                result, model=str(payload.get("model", "optimizer-local")), protocol=protocol
+                result, model=str(payload.get("model", "optimizer-local")),
+                protocol=protocol, endpoint=endpoint,
             )
             if doc_savings is not None:
                 response["optimizer"] = self._doc_meta(result)
@@ -445,6 +595,8 @@ class _Handler(BaseHTTPRequestHandler):
                     self._stream_local_anthropic(response)
                 elif protocol == "gemini":
                     self._stream_local_gemini(response)
+                elif endpoint == "responses":
+                    self._stream_local_responses(response)
                 else:
                     self._stream_local(response)
             else:
@@ -454,6 +606,11 @@ class _Handler(BaseHTTPRequestHandler):
                 route=result.decision.route, status=200,
                 ms=(time.perf_counter() - started) * 1000,
                 upstream_ms=0.0,
+                protocol=protocol,
+                response_text=(
+                    result.local_answer
+                    or (result.cached_value if isinstance(result.cached_value, str) else "")
+                ),
             )
             return
 
@@ -468,6 +625,10 @@ class _Handler(BaseHTTPRequestHandler):
         """Map a request path to (protocol, endpoint)."""
         if path in ("/v1/chat/completions", "/chat/completions"):
             return "openai", "chat"
+        if path in ("/v1/responses", "/responses"):
+            # OpenAI Responses API (gpt-5/codex models that don't serve
+            # chat/completions) — forwarded with the same wire shape.
+            return "openai", "responses"
         if path in ("/v1/messages", "/messages"):
             return "anthropic", "messages"
         if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
@@ -671,6 +832,39 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _stream_local_responses(self, response: Dict[str, Any]) -> None:
+        """Full Responses-API event sequence for a locally-served answer.
+
+        Cache/local hits for streaming Responses clients (Copilot BYOK) emit
+        the same bookend events the provider would — created → output item →
+        text deltas → completed — so the client renders the cached answer
+        without the gateway ever contacting the model.
+        """
+        item = response["output"][0]
+        text = item["content"][0]["text"]
+        in_progress = {**response, "status": "in_progress"}
+        events = [
+            ("response.created", {"type": "response.created", "response": in_progress}),
+            ("response.in_progress", {"type": "response.in_progress", "response": in_progress}),
+            ("response.output_item.added", {"type": "response.output_item.added",
+                                            "output_index": 0, "item": {**item, "status": "in_progress"}}),
+            ("response.output_text.delta", {"type": "response.output_text.delta",
+                                            "item_id": item["id"], "output_index": 0,
+                                            "content_index": 0, "delta": text}),
+            ("response.output_text.done", {"type": "response.output_text.done",
+                                           "item_id": item["id"], "output_index": 0,
+                                           "content_index": 0, "text": text}),
+            ("response.output_item.done", {"type": "response.output_item.done",
+                                           "output_index": 0, "item": item}),
+            ("response.completed", {"type": "response.completed", "response": response}),
+        ]
+        body = "".join(f"event: {event}\ndata: {json.dumps(data)}\n\n" for event, data in events).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     # ------------------------------------------------------------- upstream
     def _client_headers(self) -> Dict[str, str]:
         """Headers the client sent that the upstream must also see.
@@ -728,6 +922,64 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _compact_responses_input(self, input_value: Any) -> Any:
+        """Noise-strip text parts on the Responses wire, preserving item shape.
+
+        Message items get their text parts compacted (ANSI, trailing whitespace,
+        blank runs, diff-context and long-line elision — the same treatment the
+        chat wire's messages get); exact-repeat ``function_call_output`` items
+        collapse to an explicit marker so agent loops stop paying for the same
+        tool dump every turn. Everything else — ``function_call``,
+        ``reasoning``, images, plain strings — passes through untouched.
+        """
+        compact = self.pipeline.normalizer.compact_text
+        if isinstance(input_value, str):
+            return compact(input_value)
+        if not isinstance(input_value, list):
+            return input_value
+        out: List[Any] = []
+        prev_output_key: Optional[str] = None
+        for item in input_value:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+            kind = item.get("type")
+            if kind == "message":
+                content = item.get("content")
+                if isinstance(content, str):
+                    item = {**item, "content": compact(content)}
+                elif isinstance(content, list):
+                    item = {**item, "content": [
+                        {**p, "text": compact(p["text"])}
+                        if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                        for p in content
+                    ]}
+                out.append(item)
+                prev_output_key = None  # not consecutive with a previous output
+            elif kind == "function_call_output":
+                output = item.get("output")
+                key = json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
+                if key == prev_output_key and len(key) > 200:
+                    # Consecutive exact repeat of a *substantial* output: keep
+                    # the item (call ids differ) but drop the payload behind
+                    # the same never-silently-delete marker CDM uses.
+                    out.append({**item, "output": "[cdm: duplicate of previous tool output elided]"})
+                else:
+                    if isinstance(output, str):
+                        item = {**item, "output": compact(output, tool=True)}
+                    elif isinstance(output, list):
+                        item = {**item, "output": [
+                            {**p, "text": compact(p["text"], tool=True)}
+                            if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                            for p in output
+                        ]}
+                    out.append(item)
+                    prev_output_key = key
+            else:
+                out.append(item)
+                prev_output_key = None  # only tool outputs may repeat consecutively
+        return out
 
     def _forward(
         self,
@@ -794,8 +1046,19 @@ class _Handler(BaseHTTPRequestHandler):
                 headers.pop("authorization", None)
             headers.setdefault("anthropic-version", self.headers.get("anthropic-version", "2023-06-01"))
         else:
-            forwarded["messages"] = list(result.messages)
-            url = self.config.upstream_base.rstrip("/") + "/chat/completions"
+            if endpoint == "responses":
+                # Responses API wire: compact text parts in place (same
+                # noise-stripping the chat wire gets) and collapse exact-repeat
+                # tool outputs; typed items (function_call, reasoning, images)
+                # pass through untouched — flattening them would corrupt the
+                # request. Compaction is deterministic, so the prefix stays
+                # byte-stable and the provider's prompt cache can hit.
+                forwarded["input"] = self._compact_responses_input(payload.get("input"))
+                forwarded.pop("messages", None)
+                url = self.config.upstream_base.rstrip("/") + "/responses"
+            else:
+                forwarded["messages"] = list(result.messages)
+                url = self.config.upstream_base.rstrip("/") + "/chat/completions"
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
         self._finalize_headers(headers)
@@ -857,6 +1120,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
             )
             return
 
@@ -865,7 +1129,7 @@ class _Handler(BaseHTTPRequestHandler):
             extra["X-Optimizer-Fallback"] = fallback_note
 
         if payload.get("stream") or endpoint == "generate_content_stream":
-            self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
+            streamed = self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
             # Streaming: the relay loop IS the generation, so it's all upstream.
             upstream_ms = (time.perf_counter() - upstream_start) * 1000
             self._record_receipt(
@@ -873,6 +1137,8 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
+                response_text=streamed,
             )
             return
 
@@ -888,6 +1154,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
             )
             return
 
@@ -905,12 +1172,15 @@ class _Handler(BaseHTTPRequestHandler):
             ms=(time.perf_counter() - started) * 1000 if started else 0.0,
             upstream_ms=upstream_ms,
             upstream_cached=cached, fallback=fallback_note,
+            protocol=protocol,
+            response_text=self.pipeline._extract_content(parsed, protocol=protocol) or "",
         )
 
     def _relay_stream(
         self, upstream_resp: Any, result: PipelineResult, *, protocol: str = "openai",
         extra: Optional[Dict[str, str]] = None,
-    ) -> None:
+    ) -> str:
+        """Relay the SSE stream; return the buffered answer text (may be "")."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         for key, value in {**self._route_headers(result), **(extra or {})}.items():
@@ -971,6 +1241,58 @@ class _Handler(BaseHTTPRequestHandler):
             answer = _extract_streamed_text(buffered, protocol)
             if answer:
                 self.pipeline.cache.set(result.cache_key, answer)
+        return answer
+
+
+def _last_payload_message(payload: Dict[str, Any], protocol: str) -> Optional[Tuple[str, str]]:
+    """Newest (role, text) from the *original* wire payload, any protocol.
+
+    The conversation store keeps original bytes — never the digest-scrubbed
+    view the cache sees. Returns None when the payload carries no message
+    text at all.
+    """
+    def _parts_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            bits = []
+            for part in content:
+                if isinstance(part, dict):
+                    for key in ("text", "content"):
+                        val = part.get(key)
+                        if isinstance(val, str):
+                            bits.append(val)
+                            break
+            return "\n".join(bits)
+        return ""
+
+    items: Sequence[Any] = []
+    if protocol == "gemini":
+        items = payload.get("contents") or []
+    elif protocol == "anthropic":
+        items = payload.get("messages") or []
+    elif isinstance(payload.get("input"), list):  # openai responses
+        items = payload["input"]
+    else:  # openai chat
+        items = payload.get("messages") or []
+    for item in reversed(list(items)):
+        if not isinstance(item, dict):
+            continue
+        if protocol == "gemini":
+            role = item.get("role", "user")
+            text = "\n".join(
+                str(p.get("text", "")) for p in item.get("parts") or [] if isinstance(p, dict)
+            )
+        elif isinstance(item.get("type"), str) and item.get("type") == "message":
+            # Responses input item: {"type": "message", "role": ..., "content": [...]}
+            role = str(item.get("role", "user"))
+            text = _parts_text(item.get("content"))
+        else:
+            role = str(item.get("role", ""))
+            text = _parts_text(item.get("content"))
+        if text:
+            return (role or "user"), text
+    return None
 
 
 def _is_model_rejection(status: int, detail: str) -> bool:
@@ -1026,6 +1348,9 @@ def _extract_streamed_usage(buffered: str, protocol: str) -> Dict[str, Any]:
                 usage.update(obj["usage"])
         elif isinstance(obj.get("usage"), dict):
             usage.update(obj["usage"])
+        elif isinstance((obj.get("response") or {}).get("usage"), dict):
+            # Responses API: usage rides inside the response.completed event.
+            usage.update(obj["response"]["usage"])
     return usage
 
 
@@ -1033,10 +1358,11 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
     """Pull the assistant's answer out of relayed SSE frames.
 
     Raw ``data: {...}`` lines must never reach the cache — only the text the
-    model actually produced. Handles all three wire formats:
+    model actually produced. Handles all four wire formats:
       * openai    → choices[0].delta.content
       * anthropic → content_block_delta delta.text
       * gemini    → candidates[0].content.parts[].text
+      * responses → response.output_text.delta events
     """
     parts: List[str] = []
     for line in buffered.splitlines():
@@ -1066,6 +1392,12 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
         else:
+            if obj.get("type") == "response.output_text.delta":
+                # Responses API: text rides in typed events, not `choices`.
+                delta = obj.get("delta")
+                if isinstance(delta, str):
+                    parts.append(delta)
+                continue
             choices = obj.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
@@ -1095,6 +1427,14 @@ class TokenOptimizerProxy:
         self.pipeline = pipeline or OptimizationPipeline.with_cdn()
         # Rolling per-request receipts, shared across handler instances.
         self.receipts: Deque[Dict[str, Any]] = deque(maxlen=self.config.receipt_window)
+        # Conversation memory (observe-only): a misconfigured store must never
+        # take the gateway down — warn once and serve on.
+        self.store: Optional[ConversationStore] = None
+        if self.config.conversation_db:
+            try:
+                self.store = ConversationStore(self.config.conversation_db)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[tokan] conversation store unavailable ({exc}); serving without", flush=True)
 
         outer = self
 
@@ -1102,6 +1442,7 @@ class TokenOptimizerProxy:
             pipeline = outer.pipeline
             config = outer.config
             receipts = outer.receipts
+            store = outer.store
 
         self._server = _GatewayServer((self.config.host, self.config.port), Handler)
         self._thread: Optional[threading.Thread] = None
@@ -1161,6 +1502,8 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--cache-db", default=None, help="sqlite file for a persistent edge cache")
     parser.add_argument("--fallback-model", default=None, help="retry once with this model on model_not_supported")
     parser.add_argument("--log-requests", action="store_true", help="print one receipt line per request")
+    parser.add_argument("--conversation-db", default=None,
+                        help="sqlite file for the append-only conversation store (observe-only)")
     args = parser.parse_args(argv)
     try:
         upstream, extra_headers, fallback_headers = resolve_upstream_flags(args)
@@ -1185,6 +1528,7 @@ def main(argv: Optional[list] = None) -> None:
             fallback_headers=fallback_headers,
             fallback_model=args.fallback_model,
             log_requests=args.log_requests,
+            conversation_db=args.conversation_db,
         ),
         pipeline,
     )

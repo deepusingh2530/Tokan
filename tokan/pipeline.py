@@ -22,9 +22,10 @@ Content is stored as plain text and shaped per protocol at serve time.
 """
 
 import json
+import re
 import uuid as uuid_mod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
 from .cache import CDNConfig, EdgeCache
 from .cdm import CanonicalRecord, CDMNormalizer, estimate_tokens
@@ -35,7 +36,7 @@ from .session import PrefixReuse, SessionTracker
 
 __all__ = [
     "OptimizationPipeline", "PipelineResult", "LocalExecutor",
-    "upstream_cached_tokens", "usage_cached_tokens",
+    "upstream_cached_tokens", "usage_cached_tokens", "responses_input_to_messages",
     "PrefixReuse", "SessionTracker", "DocumentStore",
 ]
 
@@ -67,8 +68,86 @@ def usage_cached_tokens(usage: Mapping[str, Any], *, protocol: str = "openai") -
         return int(usage.get("cachedContentTokenCount") or 0)
     if protocol == "anthropic":
         return int(usage.get("cache_read_input_tokens") or 0)
-    details = usage.get("prompt_tokens_details") or {}
+    # Chat wire: prompt_tokens_details; Responses wire: input_tokens_details.
+    details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details") or {}
     return int(details.get("cached_tokens") or 0)
+
+
+def responses_input_to_messages(input_value: Any) -> List[Dict[str, Any]]:
+    """Map a Responses-API ``input`` to chat-shaped messages for the pipeline.
+
+    The Responses wire carries conversation history as typed items (``message``,
+    ``function_call``, ``function_call_output``, ``reasoning``, ...). The
+    pipeline's cache digest, session prefix tracking and local executor all
+    speak ``messages``, so items are *projected* here — never forwarded; the
+    wire itself is compacted in place at forward time. Tool outputs project as
+    ``tool`` role so CDM tool-elision and duplicate-dropping apply to them.
+    """
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}] if input_value else []
+    if not isinstance(input_value, list):
+        return []
+    messages: List[Dict[str, Any]] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "message" or (kind is None and item.get("role")):
+            content = item.get("content")
+            if isinstance(content, list):
+                text = "\n".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                )
+            else:
+                text = str(content or "")
+            messages.append({"role": str(item.get("role", "user")), "content": text})
+        elif kind == "function_call":
+            messages.append(
+                {"role": "assistant", "content": f"{item.get('name', '')}({item.get('arguments', '')})"}
+            )
+        elif kind == "function_call_output":
+            out = item.get("output")
+            if isinstance(out, list):
+                out = "\n".join(p.get("text", "") for p in out if isinstance(p, dict))
+            messages.append({"role": "tool", "content": str(out or "")})
+        # reasoning items are per-turn model scratchpad, not conversation:
+        # excluded on purpose so the digest tracks what the user controls.
+    return messages
+
+
+# Rotating identifiers clients embed in injected system preambles. Copilot, for
+# one, threads a per-thread id through its instructions: two byte-identical
+# asks in fresh chats then differ by exactly these tokens — same length,
+# different characters — which used to defeat the cache every time.
+_VOLATILE_PATTERNS = (
+    (re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"), "<uuid>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b"), "<ts>"),
+    (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<hex>"),
+)
+
+# Copilot stamps wall-clock time into the *user* turn as a
+# ``<current_datetime>...</current_datetime>`` envelope (millisecond precision,
+# local offset — rotates on every new thread). The tag is unambiguous client
+# framing, never user-authored, so its contents are canonicalized in the
+# fingerprint for any role. Text outside the envelope is left exact, and the
+# wire keeps the original bytes.
+_DATETIME_ENVELOPE = re.compile(r"<current_datetime>.*?</current_datetime>", re.DOTALL)
+
+
+def devolatile(text: str) -> "tuple[str, int]":
+    """Replace rotating identifiers with stable placeholders; returns (text, hits).
+
+    Fingerprint-scope only: applied to *system* messages before digesting, so
+    client-injected preamble noise stops changing the cache key. The forwarded
+    payload keeps the original bytes — the model sees exactly what was sent.
+    """
+    hits = 0
+    for rx, repl in _VOLATILE_PATTERNS:
+        text, n = rx.subn(repl, text)
+        hits += n
+    return text, hits
 
 
 def upstream_cached_tokens(response: Mapping[str, Any], *, protocol: str = "openai") -> int:
@@ -117,6 +196,10 @@ class PipelineResult:
     # baseline (``full_tokens``) and retrieval info so receipts/dashboard can
     # report "doc tokens avoided" against what a full resend would have cost.
     doc_savings: Optional[Dict[str, Any]] = None
+    # Count of rotating identifiers (uuid/ts/hex) scrubbed from system messages
+    # for the digest. Wire payload unchanged; >0 means client preamble noise was
+    # normalized away.
+    volatile_scrubbed: int = 0
 
     @property
     def route(self) -> str:
@@ -198,6 +281,12 @@ class OptimizationPipeline:
         changes the cache digest.
         """
         messages = payload.get("messages") or []
+        if not messages and "input" in payload:
+            # Responses API wire: the conversation lives in `input` (a string
+            # or typed items), not `messages`. Project it so the digest,
+            # session prefix tracking and cache probes see the real request —
+            # without this every responses payload fingerprints identically.
+            messages = responses_input_to_messages(payload.get("input"))
         scope = {k: payload.get(k) for k in self.scope_keys}
         if protocol == "anthropic" and payload.get("system") is not None:
             scope = dict(scope)
@@ -216,6 +305,28 @@ class OptimizationPipeline:
             messages = gemini_messages
             # Include model in scope so different models don't share cache entries.
             scope["model"] = payload.get("model", scope.get("model"))
+        # Fingerprint-scope de-volatilization: client-injected system preambles
+        # (Copilot's instructions, for one) thread rotating per-thread ids,
+        # timestamps and hex tokens through otherwise-identical asks — same
+        # length, different characters — which used to defeat the cache every
+        # time. Only *system* content is scrubbed, and only for the digest,
+        # prefix tracking and session keys; the forwarded wire payload keeps
+        # the original bytes, so the model sees exactly what was sent.
+        scrubbed: List[Dict[str, Any]] = []
+        volatile_hits = 0
+        for m in messages:
+            content = m.get("content")
+            if m.get("role") == "system" and isinstance(content, str):
+                text, n = devolatile(content)
+                volatile_hits += n
+                scrubbed.append({**m, "content": text})
+            elif isinstance(content, str) and _DATETIME_ENVELOPE.search(content):
+                scrubbed.append({**m, "content": _DATETIME_ENVELOPE.sub("<current_datetime/>", content)})
+                volatile_hits += 1
+            else:
+                scrubbed.append(dict(m))
+        if volatile_hits:
+            messages = scrubbed
         record = self.normalizer.fingerprint(messages, scope)
         # Session Governor: deterministic per-message strings + how much of this
         # payload repeats the previous turn's prefix (the base the provider's
@@ -235,6 +346,7 @@ class OptimizationPipeline:
                 cached_value=cached_value,
                 cached=True,
                 prefix_reuse=prefix_reuse,
+                volatile_scrubbed=volatile_hits,
             )
 
         query = self._last_user(messages)
@@ -259,6 +371,7 @@ class OptimizationPipeline:
             messages=self.normalizer.normalize_messages(messages),
             local_answer=answer,
             prefix_reuse=prefix_reuse,
+            volatile_scrubbed=volatile_hits,
         )
 
     # ------------------------------------------------------------- stage 3-4
@@ -268,6 +381,7 @@ class OptimizationPipeline:
         *,
         model: str = "local",
         protocol: str = "openai",
+        endpoint: str = "",
     ) -> Dict[str, Any]:
         """Build a protocol-shaped response for a cache/local hit and book it."""
         if result.cached:
@@ -280,6 +394,11 @@ class OptimizationPipeline:
             response = self._anthropic_response(content, model=model)
         elif protocol == "gemini":
             response = self._gemini_response(content, model=model)
+        elif endpoint == "responses":
+            # Same cached text, Responses wire: `output` items, not `choices`.
+            response = self._responses_response(
+                content, model=model, input_tokens=result.record.canonical_tokens
+            )
         else:
             response = self._openai_response(content, model=model)
         self.metrics.record(route=route, original_tokens=result.record.original_tokens, optimized_tokens=0)
@@ -392,6 +511,21 @@ class OptimizationPipeline:
             content = message.get("content")
             if isinstance(content, str):
                 return content
+        # Responses wire: output items with output_text parts, no `choices`.
+        output = response.get("output")
+        if isinstance(output, list):
+            texts = []
+            for item in output:
+                if isinstance(item, dict) and item.get("type") == "message":
+                    for p in item.get("content") or []:
+                        if (
+                            isinstance(p, dict)
+                            and p.get("type") in ("output_text", "text")
+                            and isinstance(p.get("text"), str)
+                        ):
+                            texts.append(p["text"])
+            if texts:
+                return "".join(texts)
         content = response.get("content")
         if isinstance(content, str):
             return content
@@ -450,4 +584,35 @@ class OptimizationPipeline:
                     "finishReason": "STOP",
                 }
             ]
+        }
+
+    @staticmethod
+    def _responses_response(content: str, *, model: str, input_tokens: int = 0) -> Dict[str, Any]:
+        """Responses API shape for a locally-served (cache/local) answer.
+
+        Same cached text as the chat wire would get, but shaped as a completed
+        response object so Responses-API clients (gpt-5/codex in Copilot BYOK)
+        can parse it without touching the provider.
+        """
+        output_tokens = estimate_tokens(content)
+        return {
+            "id": f"resp_optimizer_{uuid_mod.uuid4().hex[:20]}",
+            "object": "response",
+            "status": "completed",
+            "model": model,
+            "output": [
+                {
+                    "type": "message",
+                    "id": f"msg_optimizer_{uuid_mod.uuid4().hex[:20]}",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content, "annotations": []}],
+                }
+            ],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            "optimizer": {"served_without_llm": True},
         }
