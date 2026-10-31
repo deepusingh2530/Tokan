@@ -54,7 +54,8 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `test_copilot_proxy.py` — refactor_payload, RecordingUpstream, RecordingFixture, TestHeaderPassthrough, TestUpstreamFlags
 - `test_devolatile.py` — _payload, TestDevolatile, TestDigestStability
 - `test_doc_governor.py` — _contract, _question, _post, _post_status, _get, _oracle_upstream, _make_server, _run, TestChunking, TestRetrieval, TestSummary, TestDocumentStore
-- `test_enterprise_layers.py` — Config, simple_function, long_method, Processor, AppComponent, TestASTIntegrity, TestASTFallback, TestEmbeddingCache, TestRoutingAccuracy, TestEnterpriseIntegration
+- `test_enterprise_layers.py` — Config, simple_function, long_method, Processor, AppComponent, simpleFunc, LongMethod, main, TestASTIntegrity, TestASTFallback, TestEmbeddingCache, TestRoutingAccuracy
+- `test_evidence.py` — _fixture_repo, TestRepoMatchScore, TestEvidenceDocOnly, TestEvidenceCrossStore
 - `test_gemini_proxy.py` — FakeGeminiUpstream, TestGeminiProxy
 - `test_governor.py` — _Upstream, _conv, TestTokenBudget, TestContextWindowRegistry, TestClassification, TestSelection, TestDigestParity, TestWireBinding, TestSemanticCache, TestSemanticPipelineBinding, TestForwardPathE2E, TestMetricsAccounting
 - `test_jev.py` — TestJevRouter
@@ -62,7 +63,7 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `test_memory.py` — _StoreCase, TestConversationStore, TestStateExtraction, TestManifest, TestLastPayloadMessage
 - `test_pipeline_and_proxy.py` — _UpstreamServer, FakeUpstream, UpstreamFixture, TestPipeline, TestSDKClient, TestProxyGateway
 - `test_policy.py` — _Upstream, _decision, TestClassification, TestPolicyLevels, TestAuthorityProtection, TestDigestIndependence, TestLevelAwareCompactText, TestForwardPathAuthority
-- `test_repo_index.py` — TestGitignoreAwareWalk
+- `test_repo_index.py` — _fixture_repo, TestGitignoreAwareWalk, TestSymbolCache, TestRepoGraph, TestIndexCLI
 - `test_responses_route.py` — _UpstreamServer, responses_payload, TestResponsesProjection, TestStreamedResponsesExtraction, _FakeResponsesUpstream, _make_handler, TestResponsesGateway
 - `test_session_governor.py` — _post, _get, _wait_receipts, _tokenize, _make_server, _run, _cache_upstream, _conv, TestPrefixStability, TestSessionTracker, TestGovernorMetrics, TestPipelineIntegration
 - `test_tier1_v030.py` — _post, _get, _ChatUpstream, _make_server, _run, TestSqliteStore, TestReceiptsAndDashboard, _CacheUpstream, TestUpstreamPromptCache, _GatedUpstream, TestModelFallback, TestDiffCompaction
@@ -76,13 +77,14 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `cli.py` — _gateway_info, cmd_list, cmd_setup, cmd_serve, _build_pipeline, cmd_mcp, cmd_index, cmd_stats, build_parser, main
 - `client.py` — ChatResponse, OptimizedAgentClient
 - `doc.py` — _terms, chunk_text, TfidfIndex, summarize, Document, full_resend_tokens, assemble_messages, DocumentStore
+- `evidence.py` — EvidenceUnit, _content_terms, repo_match_score, EvidenceRetriever
 - `governor.py` — context_window_for, UtilityClass, ContextUnit, TokenBudget, GovernorPlan, ContextGovernor, SemanticAnswerCache, _text_of, _last_user_index, _is_verbatim_repeat, _shed_key
 - `mcp.py` — MCPServer, _version, serve_stdio, main
 - `memory.py` — _canon, content_digest, ConversationEvent, ConversationStore, ConversationState, _event_text, extract_state, ContextManifest
 - `metrics.py` — SessionMetrics
 - `pipeline.py` — LocalExecutor, usage_cached_tokens, responses_input_to_messages, devolatile, scrub_for_digest, upstream_cached_tokens, _default_handlers, PipelineResult, OptimizationPipeline
 - `policy.py` — ContentClass, Authority, CompressionLevel, ContentDecision, classify, classify_part, _classify_user, _CODE_SIGNALS, CompressionPolicy
-- `repo_index.py` — _gitignore_rules, _is_ignored, walk, collect_symbols, build_index
+- `repo_index.py` — _gitignore_rules, _is_ignored, walk, _read_text, symbols_of, collect_identifiers, collect_symbols, SymbolCache, build_index, _is_test, _py_imports, _module_map
 - `semantic_cache.py` — SemanticCacheHit, _now_mono, _stable_embedding, _cosine, semantic_digest, EmbeddingCache
 - `session.py` — PrefixReuse, SessionTracker
 - `task_router.py` — AdaptiveTaskRouter
@@ -122,4 +124,4 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `README.md`
 - `docs/ARCHITECTURE.md`
 
-<!-- 73/87 tracked files, 7150 bytes -->
+<!-- 75/89 tracked files, 7498 bytes -->
