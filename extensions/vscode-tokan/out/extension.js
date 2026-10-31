@@ -62,11 +62,14 @@ function activate(context) {
     // touch Copilot's deprecated debug.overrideProxyUrl; modern VS Code routes
     // through BYOK Custom Endpoint models in chatLanguageModels.json instead).
     const workspaceFolders = vscode.workspace.workspaceFolders;
+    // tokan.authToken is resource-scoped: read it against the workspace folder
+    // URI, or VS Code returns the default ('') and every poll 401s.
+    const cfgScope = workspaceFolders?.[0]?.uri;
     if (workspaceFolders && workspaceFolders.length > 0) {
         const rootPath = workspaceFolders[0].uri.fsPath;
         const settingsFile = path.join(rootPath, '.vscode', 'settings.json');
         const mcpFile = path.join(rootPath, '.mcp.json');
-        const config = vscode.workspace.getConfiguration('tokan');
+        const config = vscode.workspace.getConfiguration('tokan', cfgScope);
         const gatewayUrl = config.get('gatewayUrl', '');
         const authToken = config.get('authToken', '');
         try {
@@ -83,17 +86,56 @@ function activate(context) {
             console.error('Failed to write workspace settings:', e);
         }
         try {
-            const mcpConfig = {
-                servers: {
-                    tokan: {
+            // Merge into the existing file instead of clobbering it: .mcp.json may
+            // be a committed, sanitized example (mcpServers schema) or a user's own
+            // config — rewriting it wholesale would destroy their entries and drop
+            // live credentials into a tracked file. Support both the VS Code
+            // `servers` and the Claude Code `mcpServers` top-level key, and if a
+            // `tokan` entry already exists, leave it alone: once the file exists,
+            // its config belongs to the user/repo, not to this extension.
+            let mcpConfig = null;
+            if (fs.existsSync(mcpFile)) {
+                try {
+                    mcpConfig = JSON.parse(fs.readFileSync(mcpFile, 'utf8'));
+                }
+                catch {
+                    mcpConfig = null; // unreadable JSON: replace with a fresh config
+                }
+            }
+            if (mcpConfig && typeof mcpConfig === 'object') {
+                const rootKey = mcpConfig['mcpServers'] && !mcpConfig['servers']
+                    ? 'mcpServers' : 'servers';
+                const existing = mcpConfig[rootKey];
+                const hasTokan = !!(existing && typeof existing === 'object'
+                    && existing['tokan']);
+                if (!hasTokan) {
+                    // No tokan entry yet: add ours alongside whatever else lives here.
+                    if (!existing || typeof existing !== 'object') {
+                        mcpConfig[rootKey] = {};
+                    }
+                    mcpConfig[rootKey]['tokan'] = {
                         command: 'python',
                         args: ['-m', 'tokan.mcp'],
                         url: gatewayBase(gatewayUrl) + '/v1/mcp',
                         env: authToken ? { TOKAN_AUTH_TOKEN: authToken } : {}
-                    }
+                    };
+                    fs.writeFileSync(mcpFile, JSON.stringify(mcpConfig, null, 2) + '\n');
                 }
-            };
-            fs.writeFileSync(mcpFile, JSON.stringify(mcpConfig, null, 2));
+                // Pre-existing tokan entry: leave it alone — once the file exists,
+                // its config belongs to the user/repo, not to this extension.
+            }
+            else {
+                fs.writeFileSync(mcpFile, JSON.stringify({
+                    servers: {
+                        tokan: {
+                            command: 'python',
+                            args: ['-m', 'tokan.mcp'],
+                            url: gatewayBase(gatewayUrl) + '/v1/mcp',
+                            env: authToken ? { TOKAN_AUTH_TOKEN: authToken } : {}
+                        }
+                    }
+                }, null, 2) + '\n');
+            }
         }
         catch (e) {
             console.error('Failed to write .mcp.json:', e);
@@ -111,7 +153,7 @@ function activate(context) {
             return;
         }
         inflight = true;
-        const cfg = vscode.workspace.getConfiguration('tokan');
+        const cfg = vscode.workspace.getConfiguration('tokan', cfgScope);
         const gatewayUrl = cfg.get('gatewayUrl', '');
         const authToken = cfg.get('authToken', '');
         const metricsUrl = gatewayBase(gatewayUrl) + '/metrics';
@@ -160,7 +202,7 @@ function activate(context) {
     void pollMetrics();
     // 3. Command: Export Terminal Environment
     const terminalEnvCmd = vscode.commands.registerCommand('tokan.exportTerminalEnv', () => {
-        const cfg = vscode.workspace.getConfiguration('tokan');
+        const cfg = vscode.workspace.getConfiguration('tokan', cfgScope);
         const gatewayUrl = cfg.get('gatewayUrl', '');
         const authToken = cfg.get('authToken', '');
         const base = gatewayBase(gatewayUrl);
@@ -185,7 +227,7 @@ function activate(context) {
     //    configured we render authenticated /metrics in an editor tab instead
     //    (same numbers as the dashboard, no key in the URL).
     const showMetricsCmd = vscode.commands.registerCommand('tokan.showMetrics', async () => {
-        const cfg = vscode.workspace.getConfiguration('tokan');
+        const cfg = vscode.workspace.getConfiguration('tokan', cfgScope);
         const gatewayUrl = cfg.get('gatewayUrl', '');
         const authToken = cfg.get('authToken', '');
         const base = gatewayBase(gatewayUrl);

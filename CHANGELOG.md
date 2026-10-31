@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **VS Code extension 0.2.1** — three fixes found while driving it against the
+  production gateway: (a) `tokan.authToken` is resource-scoped, and every
+  `getConfiguration('tokan')` call omitted the workspace scope, so VS Code
+  returned the default `''` and each `/metrics` poll failed with 401 (the
+  status bar read `offline` despite a correct token); all call sites now pass
+  the folder URI. (b) `build.sh` zipped the package at the archive root —
+  VS Code requires entries under `extension/`, so no `.vsix` produced by the
+  script was ever installable (`extension/package.json not found inside zip`);
+  the archive is also recreated from scratch so stale layouts can't leak in.
+  (c) activation overwrote an existing `.mcp.json` wholesale, which clobbered
+  a committed, sanitized example with a live gateway credential; it now merges
+  and never replaces a pre-existing `tokan` entry.
+
 ## [1.0.1] - 2026-10-31
 
 Hardening patch driven by the first production deployment.

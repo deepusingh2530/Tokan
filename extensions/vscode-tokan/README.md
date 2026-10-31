@@ -7,9 +7,12 @@ every number is fetched from the gateway's `/metrics`, none are hardcoded.
 ## What it does
 
 1. **Wires the workspace** — writes `tokan.gatewayUrl` into
-   `.vscode/settings.json` and a `.mcp.json` pointing at the gateway's MCP
-   endpoint (Tokan keys only; it does not touch Copilot's deprecated
-   `debug.overrideProxyUrl`).
+   `.vscode/settings.json` and, when the workspace has no `.mcp.json`
+   `tokan` entry yet, creates one pointing at the gateway's MCP endpoint.
+   An existing `tokan` entry is never overwritten — a committed example or
+   a user's own config stays byte-for-byte, so live credentials can't be
+   dropped into a tracked file (Tokan keys only; it does not touch Copilot's
+   deprecated `debug.overrideProxyUrl`).
 2. **Status bar meter** — polls `GET /metrics` every 5 s and renders
    `$(zap) Tokan: x.x% saved`; the tooltip breaks it down by route, cost,
    secrets redacted and auth failures. Shows `offline` when the gateway is

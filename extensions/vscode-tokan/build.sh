@@ -22,16 +22,19 @@ if ! grep -q "gatewayBase" out/extension.js 2>/dev/null; then
   exit 1
 fi
 
-# Package .vsix (zip-based)
+# Package .vsix (zip-based). VS Code requires every entry under extension/.
 rm -rf .build
-mkdir -p .build
-cp package.json .build/
-cp -r out .build/
-cp -r src .build/ 2>/dev/null || true
-[ -f README.md ] && cp README.md .build/
+mkdir -p .build/extension
+cp package.json .build/extension/
+cp -r out .build/extension/
+cp -r src .build/extension/ 2>/dev/null || true
+[ -f README.md ] && cp README.md .build/extension/
 
+# zip updates an existing archive in place — always start from scratch so a
+# stale layout from an older build can never leak into the package.
+rm -f "vscode-tokan-${VERSION}.vsix"
 cd .build
-zip -qr "../vscode-tokan-${VERSION}.vsix" .
+zip -qr "../vscode-tokan-${VERSION}.vsix" extension
 cd ..
 rm -rf .build
 
