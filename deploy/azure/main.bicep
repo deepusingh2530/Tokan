@@ -12,6 +12,18 @@
 // Authorization header before forwarding upstream. For stricter secret
 // handling, move it to Key Vault and switch the container to an env-var
 // secret reference.
+//
+// M6 hardening: inbound auth, secret posture, quality gate, routing wire-up.
+// - inboundApiKeys: comma-separated keys for --api-keys / TOKAN_API_KEYS.
+//   Clients present as Authorization: Bearer <key> or X-Optimizer-Api-Key: <key>.
+//   Empty = no inbound auth (loopback-only binds, fail-closed without keys).
+// - redactSecrets: opt-in replaces detected secrets with [REDACTED:<type>]
+//   before canonicalization, cache digest, and upstream call.
+// - docFallbackFull: quality gate — low-coverage doc asks send the full document.
+// - taskRouter: classify requests into tier_0/1/2 and disclose on receipts/headers/metrics.
+// - tier1Model: explicit model rewrite for tier_1 requests (never defaulted).
+// - upstreamApiKey: upstream/injectable key (marked @secure(), kept separate
+//   from inbound auth so BYOK/plan-gated flows keep working).
 
 param location string = resourceGroup().location
 param appName string = 'tokan-gateway'
@@ -25,6 +37,24 @@ param containerImage string
 param upstreamUrl string
 @secure()
 param upstreamApiKey string
+
+// M6 inbound auth: comma-separated gateway keys (env TOKAN_API_KEYS).
+// Clients send one as Authorization: Bearer <key> or
+// X-Optimizer-Api-Key: <key>. Either candidate is compared with
+// hmac.compare_digest (constant-time). /healthz stays open for probes;
+// everything else requires a key when this is non-empty.
+// Empty = no inbound auth, which is fine on the default loopback bind.
+param inboundApiKeys string = ''
+
+// M6 feature flags (all default off).
+// --redact-secrets: replace detected secrets before anything leaves the machine.
+// --doc-fallback-full: quality gate — low-coverage doc asks send the full document.
+// --task-router: classify each request into a routing tier and disclose it.
+// --tier1-model: explicit model rewrite for tier_1 requests (never defaulted).
+param redactSecrets bool = false
+param docFallbackFull bool = false
+param taskRouter bool = false
+param tier1Model string = ''
 
 // Session metrics are per-process in-memory; >1 replica would serve
 // inconsistent dashboard views. Scale-out requires centralized metrics
@@ -104,7 +134,11 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'gateway'
           image: containerImage
           command: ['python']
-          args: [
+          // Flags are appended conditionally: Bicep arrays are homogeneously
+          // typed (all strings), so boolean params expand to either their
+          // flag string or nothing at all — an empty-string arg would reach
+          // argparse as a stray positional.
+          args: concat([
             '-m'
             'tokan.cli'
             'serve'
@@ -118,11 +152,22 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             upstreamApiKey
             '--prompt-cache-key'
             '--log-requests'
-          ]
+            '--api-keys'
+            inboundApiKeys
+          ],
+          redactSecrets ? ['--redact-secrets'] : [],
+          docFallbackFull ? ['--doc-fallback-full'] : [],
+          taskRouter ? ['--task-router'] : [],
+          tier1Model != '' ? ['--tier1-model', tier1Model] : []
+          )
           env: [
             { name: 'REDIS_URL', value: 'redis://${redisCache.properties.hostName}:${redisCache.properties.sslPort}/0' }
             { name: 'KEYVAULT_URL', value: 'https://${keyVault.properties.vaultUri}' }
             { name: 'TOKAN_TIER', value: 'production' }
+            // M6: inbound auth keys (read by `serve` as --api-keys default;
+            // also passed explicitly in args above). Feature flags are CLI
+            // args only — they are not env-configurable, so no env mirror.
+            { name: 'TOKAN_API_KEYS', value: inboundApiKeys }
           ]
           resources: {
             cpu: 2

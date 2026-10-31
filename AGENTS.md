@@ -32,15 +32,16 @@ Generated map of `Tokan` — structural index only; read files on demand.
 
 ## extensions/vscode-tokan/
 
+- `README.md`
 - `build.sh`
 
 ## extensions/vscode-tokan/out/
 
-- `extension.js` — gatewayBase, activate, deactivate
+- `extension.js` — gatewayBase, authHeaders, activate, deactivate
 
 ## extensions/vscode-tokan/src/
 
-- `extension.ts` — gatewayBase, activate, deactivate
+- `extension.ts` — gatewayBase, authHeaders, activate, deactivate
 
 ## tests/
 
@@ -54,8 +55,9 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `test_copilot_proxy.py` — refactor_payload, RecordingUpstream, RecordingFixture, TestHeaderPassthrough, TestUpstreamFlags
 - `test_devolatile.py` — _payload, TestDevolatile, TestDigestStability
 - `test_doc_governor.py` — _contract, _question, _post, _post_status, _get, _oracle_upstream, _make_server, _run, TestChunking, TestRetrieval, TestSummary, TestDocumentStore
-- `test_enterprise_layers.py` — Config, simple_function, long_method, Processor, AppComponent, simpleFunc, LongMethod, main, TestASTIntegrity, TestASTFallback, TestEmbeddingCache, TestRoutingAccuracy
+- `test_enterprise_layers.py` — Config, simple_function, long_method, Processor, AppComponent, TestASTIntegrity, TestASTFallback, TestEmbeddingCache, TestRoutingAccuracy, TestEnterpriseIntegration
 - `test_evidence.py` — _fixture_repo, TestRepoMatchScore, TestEvidenceDocOnly, TestEvidenceCrossStore
+- `test_gateway_auth.py` — _post, _post_status, _get, _get_status, _EchoUpstream, _run, _chat_payload, TestEnsureBindSafety, TestInboundAuth, TestSecretPosture, _doc_config, TestDocQualityGate
 - `test_gemini_proxy.py` — FakeGeminiUpstream, TestGeminiProxy
 - `test_governor.py` — _Upstream, _conv, TestTokenBudget, TestContextWindowRegistry, TestClassification, TestSelection, TestDigestParity, TestWireBinding, TestSemanticCache, TestSemanticPipelineBinding, TestForwardPathE2E, TestMetricsAccounting
 - `test_jev.py` — TestJevRouter
@@ -65,6 +67,7 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `test_policy.py` — _Upstream, _decision, TestClassification, TestPolicyLevels, TestAuthorityProtection, TestDigestIndependence, TestLevelAwareCompactText, TestForwardPathAuthority
 - `test_repo_index.py` — _fixture_repo, TestGitignoreAwareWalk, TestSymbolCache, TestRepoGraph, TestIndexCLI
 - `test_responses_route.py` — _UpstreamServer, responses_payload, TestResponsesProjection, TestStreamedResponsesExtraction, _FakeResponsesUpstream, _make_handler, TestResponsesGateway
+- `test_secret.py` — TestDetectionPrecision, TestRedaction, TestDigestHygiene, TestPatternSet
 - `test_session_governor.py` — _post, _get, _wait_receipts, _tokenize, _make_server, _run, _cache_upstream, _conv, TestPrefixStability, TestSessionTracker, TestGovernorMetrics, TestPipelineIntegration
 - `test_tier1_v030.py` — _post, _get, _ChatUpstream, _make_server, _run, TestSqliteStore, TestReceiptsAndDashboard, _CacheUpstream, TestUpstreamPromptCache, _GatedUpstream, TestModelFallback, TestDiffCompaction
 
@@ -85,6 +88,7 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `pipeline.py` — LocalExecutor, usage_cached_tokens, responses_input_to_messages, devolatile, scrub_for_digest, upstream_cached_tokens, _default_handlers, PipelineResult, OptimizationPipeline
 - `policy.py` — ContentClass, Authority, CompressionLevel, ContentDecision, classify, classify_part, _classify_user, _CODE_SIGNALS, CompressionPolicy
 - `repo_index.py` — _gitignore_rules, _is_ignored, walk, _read_text, symbols_of, collect_identifiers, collect_symbols, SymbolCache, build_index, _is_test, _py_imports, _module_map
+- `secret.py` — SecretFinding, detect_secrets, redact_text, count_payload_secrets, redact_payload
 - `semantic_cache.py` — SemanticCacheHit, _now_mono, _stable_embedding, _cosine, semantic_digest, EmbeddingCache
 - `session.py` — PrefixReuse, SessionTracker
 - `task_router.py` — AdaptiveTaskRouter
@@ -116,12 +120,13 @@ Generated map of `Tokan` — structural index only; read files on demand.
 
 - `__init__.py`
 - `__main__.py`
-- `interceptor.py` — resolve_upstream_flags, add_upstream_flags, ProxyConfig, _Handler, _last_payload_message, _is_model_rejection, _extract_streamed_usage, _extract_streamed_text, _GatewayServer, TokenOptimizerProxy, main
+- `interceptor.py` — resolve_upstream_flags, add_upstream_flags, ProxyConfig, ensure_bind_safety, _Handler, _last_payload_message, _is_model_rejection, _extract_streamed_usage, _extract_streamed_text, _GatewayServer, TokenOptimizerProxy, main
 
 ## Docs
 - `AGENTS.md`
 - `CONTRIBUTING.md`
 - `README.md`
 - `docs/ARCHITECTURE.md`
+- `extensions/vscode-tokan/README.md`
 
-<!-- 75/89 tracked files, 7498 bytes -->
+<!-- 79/93 tracked files, 7848 bytes -->

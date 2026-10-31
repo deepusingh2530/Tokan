@@ -28,5 +28,10 @@ EXPOSE 4040
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:4040/healthz || exit 1
 
-# Launch gateway
-CMD ["python", "-m", "tokan.cli", "serve", "--host", "0.0.0.0", "--port", "4040"]
+# Launch gateway with M6 hardening flags.
+# Env vars TOKEN_API_KEYS, TOkan_REDACT_SECRETS, TOkan_DOC_FALLBACK_FULL,
+# TOkan_TASK_ROUTER are read by tokan.cli.serve(); they are set at container
+# start time (e.g. via Bicep, Kubernetes, or docker run -e).
+CMD ["python", "-m", "tokan.cli", "serve", \
+     "--host", "0.0.0.0", \
+     "--port", "4040"]

@@ -48,15 +48,15 @@ Numbering follows the target module list in the master plan.
 | # | Target module | Exists as | Gap |
 |---|---|---|---|
 | 1 | Protocol adapters | interceptor path-dispatch + `prepare()` | no canonical model; per-protocol ad-hoc projection; no reconstruction guarantee |
-| 2 | Auth/scope guard | — | no inbound auth, no tenant/user scope (M6) |
+| 2 | Auth/scope guard | `tokan/proxy/interceptor.py::_check_auth` (M6): key-based inbound auth via `--api-keys`/`TOKAN_API_KEYS`, `Authorization: Bearer` or `X-Optimizer-Api-Key`, constant-time compare, `/healthz` exempt, fail-closed bind gate (`ensure_bind_safety`) | tenant/user scope (schema column exists; not enforced) |
 | 3 | Canonical request model | `tokan/canonical.py` (M2) | pipeline adoption in M3 (governor consumes `fingerprint_view`) |
 | 4 | Content classifier | `tokan/policy.py` (M3) | typed classes + authority tiers; user/system capped L1 |
-| 5 | Secret protector | none | secret detection/redaction (M6) |
+| 5 | Secret protector | `tokan/secret.py` (M6): 10 documented patterns, overlap-safe, detect-and-disclose by default, opt-in `--redact-secrets` replaces with `[REDACTED:<type>]` before canonicalization/digest/upstream (digest-hygienic) | — |
 | 6 | Conversation store | `tokan/memory.py` (M1) | done |
 | 7 | Conversation state extractor | `ConversationState` (M1, deterministic) | done |
-| 8 | Context Governor | `tokan/governor.py` (M4) | progressive expansion loop (M6); gemini/responses shedding (M6) |
+| 8 | Context Governor | `tokan/governor.py` (M4) | progressive expansion loop (open); gemini/responses shedding (open) |
 | 9 | Repository intelligence | `SymbolCache` + `RepoGraph` (`tokan/repo_index.py`, M5): incremental index, definitions/references/imports/test edges, `index --cache/--graph-out`, MCP `repo_graph` | done (regex/import heuristics, documented) |
-| 10 | Document intelligence | doc.py TF-IDF + `Document.coverage` (M5): idf-weighted coverage detection, low-coverage prompt caveat + disclosure, `doc_low_coverage` counter | done (auto-fallback deferred to M6) |
+| 10 | Document intelligence | doc.py TF-IDF + `Document.coverage` (M5): idf-weighted coverage detection, low-coverage prompt caveat + disclosure, `doc_low_coverage` counter; full-document fallback behind `--doc-fallback-full` (M6) | done |
 | 11 | Relevance/dependency retriever | `EvidenceRetriever` (`tokan/evidence.py`, M5): cross-store ranked units, per-store scores, `POST /v1/evidence` (docs) + MCP `evidence` (docs+repo) | done |
 | 12 | Token Budget Controller | `TokenBudget` + `context_window_for` (M4) | done (operator override via `--context-window`) |
 | 13 | CDM normalization | production | explicit L0–L4 levels + policy engine (`tokan/policy.py`, M3) |
@@ -64,15 +64,15 @@ Numbering follows the target module list in the master plan.
 | 15 | Prefix-cache optimizer | `--prompt-cache-key` + stable ordering + session measurement | formal prompt-ordering module (deferred; measurement honest in `session.py`) |
 | 16 | Semantic cache | `SemanticAnswerCache` (M4, opt-in conservative) | done (factual-only, model-scoped, 0.97 threshold, TTL+LRU) |
 | 17 | Intermediate-artifact cache | none | summaries/embeddings/index caches (M3–M5) |
-| 18 | JeV decision engine | binary local/llm | multi-route policy + tiers (M6) |
-| 19 | Deterministic executors | line_lookup only | executor plugin API + suite (M6) |
-| 20 | Model router | single `--fallback-model` retry | capability tiers, chains, budget (M6) |
-| 21 | Prompt assembler | inline per-protocol + governor-driven `messages` shedding (M4) | gemini/responses governor assembly (M6) |
-| 22 | Quality gate | — | pre/post deterministic checks (M6) |
-| 23 | Progressive fallback | — | context expansion loop (M6) |
+| 18 | JeV decision engine | binary local/llm + M6 `AdaptiveTaskRouter` classify-only tiers (`--task-router`) | multi-route policy (open) |
+| 19 | Deterministic executors | line_lookup only | executor plugin API + suite (open) |
+| 20 | Model router | single `--fallback-model` retry + M6 `--tier1-model` opt-in rewrite | capability tiers, chains, budget (open) |
+| 21 | Prompt assembler | inline per-protocol + governor-driven `messages` shedding (M4) | gemini/responses governor assembly (open) |
+| 22 | Quality gate | doc low-coverage detection (M5) + `--doc-fallback-full` full-doc fallback (M6) | pre/post-call deterministic checks (open) |
+| 23 | Progressive fallback | governor expansion loop (M4) | — |
 | 24 | Memory update pipeline | cache fill only | M1 begins it (events); responses wired M2 |
 | 25 | Optimization receipts | receipts + headers + `ContextManifest` ledger (M1/M4) | done |
-| 26 | Metrics/tracing/eval | metrics + dashboard + benchmark scripts | OTel, locked counters, CI eval harness (M2–M6) |
+| 26 | Metrics/tracing/eval | metrics + dashboard + benchmark scripts + M6 counters (auth/secrets/doc-fallback/tiers) | OTel, CI eval harness (open) |
 
 ## 3. Phased plan
 
@@ -153,9 +153,19 @@ Small, independently testable milestones. Each lands with tests + measurements.
   reported honestly as synthetic, not production precision. The inverted
   reference pass also made uncached graph builds ~9x faster on a 600-file
   corpus (O(total identifiers) instead of O(symbols × files)).
-- **M6: Quality gate + routing + production hardening** — pre/post-call
-  deterministic validation, multi-tier model routing, executor plugin API,
-  auth (bearer/tenant scoping), rate limits, OTel, eval harness in CI.
+- **M6 (done): Hardening — inbound auth, secret hygiene, doc quality gate,
+  routing wire-up** — `--api-keys`/`TOKAN_API_KEYS` inbound auth (dual-header
+  candidates so BYOK provider credentials in `Authorization` never mask the
+  gateway key; `hmac.compare_digest`; `/healthz` exempt; non-loopback binds
+  fail closed without keys unless `--allow-insecure`), `tokan/secret.py`
+  detection with opt-in `--redact-secrets` (detect-and-disclose default;
+  redacted bytes never reach the cache digest), `--doc-fallback-full`
+  quality gate (low-coverage asks send the whole document, line-wrapped so
+  CDM long-line elision cannot truncate it), and `--task-router`
+  (`AdaptiveTaskRouter` classify-only: tier disclosed on receipts/headers/
+  `/metrics` `tiers`; `--tier1-model` opt-in model rewrite, never defaulted).
+  All flags default off — byte-identical to M5 when unset. Rate limits, OTel,
+  and the CI eval harness remain open (see §7/§8).
 
 ## 4. M1 — interfaces and storage schema
 
@@ -272,31 +282,37 @@ compatibility). Receipts carry a request `rid` unconditionally since M2
 
 ## 6. Security threat model (summary)
 
-Trust boundaries: agent → gateway (currently unauthenticated), gateway →
-provider (key injected server-side), gateway → stores (local disk).
+Trust boundaries: agent → gateway (M6: authenticated when `--api-keys` is
+set — the ACA production deployment runs with keys; loopback-only binds need
+none), gateway → provider (key injected server-side), gateway → stores (local
+disk).
 
 M1 mitigations: tenant column in the store schema (isolation from day one),
 per-event integrity digests, retention support, no secrets in manifests
 (digests and counts only), conversation content never logged unless
 `--log-requests`.
 
-Known accepted risks until M6: no inbound authentication (mitigated by bind
-address + network placement; ACA deployment is publicly reachable — auth is the
-top M6 item); no TLS on the gateway itself (terminate at ACA/ingress);
-`/dashboard` and `/receipts` unauthenticated.
+Resolved in M6: inbound authentication (`--api-keys`, dual-header candidates,
+constant-time compare, fail-closed bind gate); `/dashboard` and `/receipts`
+are behind the same auth as `/metrics`. Remaining accepted risks: no
+tenant/user scope enforcement (schema column exists); no TLS on the gateway
+itself (terminate at ACA/ingress); rate limiting not yet implemented (bind
+fail-closed + key auth are the current controls).
 
 ## 7. Observability plan
 
 M1: receipts + `/metrics` + `/dashboard` unchanged; manifests persisted for
-offline analysis. M2: request ids everywhere, locked counters. M6: OpenTelemetry
-traces per stage (prepare → governor → upstream), structured logs, no raw
-prompts by default.
+offline analysis. M2: request ids everywhere, locked counters. M6 added the
+auth/secrets/doc-fallback/tier counters on `/metrics` + dashboard cards.
+Still open: OpenTelemetry traces per stage (prepare → governor → upstream),
+structured logs, no raw prompts by default (prompts stay unlogged unless
+`--log-requests`).
 
 ## 8. Evaluation methodology
 
 Existing harnesses (`benchmarks/prefix_cache.py`, `scenarios.py`, `doc_qa.py`,
 `repo_ab.py`, Copilot A/B) provide token and quality baselines. M4 adds the
-quality gate with deterministic checks; M6 runs the workload matrix (long
+quality gate with deterministic checks. Still open: the workload matrix (long
 conversations, debugging, refactoring, tool-heavy loops, conflicting
 instructions, cache invalidation) in CI against golden datasets, comparing
 baseline vs lossless vs semantic vs aggressive vs progressive-fallback modes.

@@ -84,3 +84,6 @@ PUSH_TO_GITHUB.md
 setup_github.sh
 READY_TO_PUSH.md
 extensions/vscode-tokan/node_modules/
+
+# Bicep build output (regenerate: az bicep build --file deploy/azure/main.bicep)
+deploy/azure/main.json
