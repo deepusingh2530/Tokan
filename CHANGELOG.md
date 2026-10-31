@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-31
+
+Hardening patch driven by the first production deployment.
+
+- **`serve --api-key` can now come from the environment** (`TOKAN_UPSTREAM_API_KEY`)
+  as a default, matching the standalone proxy CLI's long-standing
+  `OPENAI_API_KEY` behavior. The variable is deliberately namespaced
+  (`OPENAI_API_KEY` is *not* read): an agent's exported key must never be
+  silently repurposed as the gateway's upstream credential, and an explicit
+  `--api-key` still beats the environment. This lets deployments inject the
+  upstream key via a Key Vault secret reference so the secret never appears
+  in container args / revision history. No-flag behavior is unchanged.
+
 ## [1.0.0] - 2026-10-31
 
 First stable release. **Compatibility statement:** the provider wires

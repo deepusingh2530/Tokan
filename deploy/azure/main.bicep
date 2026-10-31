@@ -6,15 +6,15 @@
 // pipeline (AST compaction, semantic cache, adaptive routing) before
 // forwarding upstream.
 //
-// Auth note: upstreamApiKey is a deployment parameter (marked @secure(), so
-// its value is redacted from deployment history) and is passed to the
-// container as `--api-key`, which makes the gateway REPLACE any client's
-// Authorization header before forwarding upstream. For stricter secret
-// handling, move it to Key Vault and switch the container to an env-var
-// secret reference.
+// Auth note: the upstream key and the inbound keys never appear in container
+// args. They are written into Key Vault as secrets (from @secure() params,
+// redacted from deployment history), and the container reads them from env
+// vars backed by Key Vault references — which requires a user-assigned
+// managed identity with `get` on the vault. `--api-key` makes the gateway
+// REPLACE any client's Authorization header before forwarding upstream.
 //
 // M6 hardening: inbound auth, secret posture, quality gate, routing wire-up.
-// - inboundApiKeys: comma-separated keys for --api-keys / TOKAN_API_KEYS.
+// - inboundApiKeys: comma-separated keys exposed as env TOKAN_API_KEYS.
 //   Clients present as Authorization: Bearer <key> or X-Optimizer-Api-Key: <key>.
 //   Empty = no inbound auth (loopback-only binds, fail-closed without keys).
 // - redactSecrets: opt-in replaces detected secrets with [REDACTED:<type>]
@@ -38,12 +38,14 @@ param upstreamUrl string
 @secure()
 param upstreamApiKey string
 
-// M6 inbound auth: comma-separated gateway keys (env TOKAN_API_KEYS).
+// M6 inbound auth: comma-separated gateway keys, written into Key Vault and
+// exposed to the container as env TOKAN_API_KEYS (Key Vault reference).
 // Clients send one as Authorization: Bearer <key> or
 // X-Optimizer-Api-Key: <key>. Either candidate is compared with
 // hmac.compare_digest (constant-time). /healthz stays open for probes;
 // everything else requires a key when this is non-empty.
 // Empty = no inbound auth, which is fine on the default loopback bind.
+@secure()
 param inboundApiKeys string = ''
 
 // M6 feature flags (all default off).
@@ -66,6 +68,20 @@ param redisName string = 'tokan-redis'
 param keyVaultName string = 'tokan-kv'
 param openaiKeyName string = 'openai-api-key'
 param anthropicKeyName string = 'anthropic-api-key'
+// App-scoped secret names the container references from env. These are the
+// names in `configuration.secrets` (ACA side), not in Key Vault.
+param upstreamSecretName string = 'tokan-upstream-key'
+param gatewayKeysSecretName string = 'tokan-gateway-keys'
+
+// User-assigned identity the container app uses to read Key Vault secrets.
+// User-assigned (not system-assigned) so its principalId exists before the
+// vault access policy and the container app are both created — a
+// system-assigned identity would create a dependency cycle (vault policy
+// needs the app, the app's env needs the vault).
+resource gatewayIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: '${appName}-identity'
+  location: location
+}
 
 resource redisCache 'Microsoft.Cache/redis@2024-11-01' = {
   name: redisName
@@ -84,16 +100,27 @@ resource keyVault 'Microsoft.KeyVault/vaults@2024-04-01-preview' = {
   properties: {
     tenantId: subscription().tenantId
     sku: { family: 'A', name: 'standard' }
-    accessPolicies: []
+    // The gateway's user-assigned identity gets read-only secret access —
+    // enough to resolve the two env references, not enough to rotate.
+    accessPolicies: [
+      {
+        tenantId: subscription().tenantId
+        objectId: gatewayIdentity.properties.principalId
+        permissions: { secrets: ['get', 'list'] }
+      }
+    ]
     enableSoftDelete: true
   }
 }
 
+// The upstream key lands in Key Vault straight from the @secure() param, so
+// the secret value is never materialized in the template, deployment history,
+// or container args — the container only ever sees the env reference.
 resource openAiSecret 'Microsoft.KeyVault/vaults/secrets@2024-04-01-preview' = {
   parent: keyVault
   name: openaiKeyName
   properties: {
-    value: 'REPLACE_WITH_OPENAI_KEY'
+    value: upstreamApiKey
     contentType: 'text/plain'
   }
 }
@@ -103,6 +130,20 @@ resource anthropicSecret 'Microsoft.KeyVault/vaults/secrets@2024-04-01-preview' 
   name: anthropicKeyName
   properties: {
     value: 'REPLACE_WITH_ANTHROPIC_KEY'
+    contentType: 'text/plain'
+  }
+}
+
+// Inbound gateway keys also live in Key Vault (the container reads them via
+// env TOKAN_API_KEYS). Key Vault accepts an empty value, which matches the
+// gateway's "empty = no inbound auth" contract — deliberately NOT replaced
+// by a placeholder, since a known placeholder value would become a working,
+// publicly-known gateway key.
+resource gatewayKeysSecret 'Microsoft.KeyVault/vaults/secrets@2024-04-01-preview' = {
+  parent: keyVault
+  name: 'tokan-gateway-keys'
+  properties: {
+    value: inboundApiKeys
     contentType: 'text/plain'
   }
 }
@@ -118,6 +159,14 @@ resource containerAppEnv 'Microsoft.App/managedEnvironments@2024-03-01' = {
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: appName
   location: location
+  identity: {
+    // User-assigned identity that resolves the Key Vault secret references
+    // below. Declared above as `gatewayIdentity`.
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${gatewayIdentity.id}': {}
+    }
+  }
   properties: {
     environmentId: containerAppEnv.id
     configuration: {
@@ -127,6 +176,21 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         targetPort: 4040
         traffic: [{ weight: 100, latestRevision: true }]
       }
+      // Secrets the container references by name from env. The two gateway
+      // keys are Key Vault references: the value is resolved at container
+      // start via the managed identity and never stored in the app config.
+      secrets: [
+        {
+          name: upstreamSecretName
+          keyVaultUrl: openAiSecret.properties.secretUriWithVersion
+          identity: gatewayIdentity.id
+        }
+        {
+          name: gatewayKeysSecretName
+          keyVaultUrl: gatewayKeysSecret.properties.secretUriWithVersion
+          identity: gatewayIdentity.id
+        }
+      ]
     }
     template: {
       containers: [
@@ -138,6 +202,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           // typed (all strings), so boolean params expand to either their
           // flag string or nothing at all — an empty-string arg would reach
           // argparse as a stray positional.
+          //
+          // No --api-key / --api-keys here on purpose: both credentials come
+          // from env (Key Vault references) so they never appear in the
+          // revision spec, `az containerapp show`, or deployment history.
           args: concat([
             '-m'
             'tokan.cli'
@@ -148,12 +216,8 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             '4040'
             '--upstream'
             upstreamUrl
-            '--api-key'
-            upstreamApiKey
             '--prompt-cache-key'
             '--log-requests'
-            '--api-keys'
-            inboundApiKeys
           ],
           redactSecrets ? ['--redact-secrets'] : [],
           docFallbackFull ? ['--doc-fallback-full'] : [],
@@ -164,10 +228,13 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'REDIS_URL', value: 'redis://${redisCache.properties.hostName}:${redisCache.properties.sslPort}/0' }
             { name: 'KEYVAULT_URL', value: 'https://${keyVault.properties.vaultUri}' }
             { name: 'TOKAN_TIER', value: 'production' }
-            // M6: inbound auth keys (read by `serve` as --api-keys default;
-            // also passed explicitly in args above). Feature flags are CLI
-            // args only — they are not env-configurable, so no env mirror.
-            { name: 'TOKAN_API_KEYS', value: inboundApiKeys }
+            // Secrets via Key Vault references (see configuration.secrets).
+            // TOKAN_UPSTREAM_API_KEY is the upstream credential `serve` uses
+            // as the --api-key default; TOKAN_API_KEYS holds the inbound
+            // gateway keys. Feature flags are CLI args only — they are not
+            // env-configurable, so no env mirror.
+            { name: 'TOKAN_UPSTREAM_API_KEY', secretRef: upstreamSecretName }
+            { name: 'TOKAN_API_KEYS', secretRef: gatewayKeysSecretName }
           ]
           resources: {
             cpu: 2
@@ -203,9 +270,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         ]
       }
     }
-  }
-  identity: {
-    type: 'SystemAssigned'
   }
 }
 

@@ -399,7 +399,8 @@ token-optimizer --help              # All commands and flags
 --host 127.0.0.1                    # Bind address
 --port 4040                         # Listen port
 --upstream URL                      # OpenAI upstream (default https://api.openai.com/v1)
---api-key KEY                       # OpenAI API key (client keys pass through if unset)
+--api-key KEY                       # OpenAI API key (client keys pass through if unset;
+                                    #   default: env TOKAN_UPSTREAM_API_KEY)
 --anthropic-upstream URL            # Anthropic upstream (default https://api.anthropic.com)
 --anthropic-api-key KEY             # Anthropic API key
 --gemini-upstream URL               # Gemini upstream (default https://generativelanguage.googleapis.com)
@@ -454,7 +455,8 @@ price_per_million_tokens = 2.50
 
 | Variable | Purpose |
 |----------|---------|
-| `OPENAI_API_KEY` | OpenAI upstream auth (also read by agents) |
+| `OPENAI_API_KEY` | OpenAI auth for agents/SDKs (the gateway deliberately does **not** read it) |
+| `TOKAN_UPSTREAM_API_KEY` | Gateway upstream key — default for `serve --api-key` (namespaced so an agent's exported key is never repurposed; lets the key live in a secret manager / Key Vault reference instead of argv) |
 | `ANTHROPIC_API_KEY` | Anthropic upstream auth |
 | `GEMINI_API_KEY` | Gemini upstream auth (read by `serve`; sent as `x-goog-api-key`) |
 | `OPENAI_BASE_URL` | Point OpenAI SDK at Tokan gateway |
@@ -1376,10 +1378,18 @@ stack traces with tokens. Tokan handles them two ways:
 ### API Key Management
 
 - **Never commit API keys** to version control
-- Use environment variables: `export OPENAI_API_KEY=sk-...`
+- Use environment variables: `export TOKAN_UPSTREAM_API_KEY=sk-...`
   (gateway keys: `export TOKAN_API_KEYS=...`)
+  The gateway reads the upstream key from `TOKAN_UPSTREAM_API_KEY` (not
+  `OPENAI_API_KEY`, which is left to agents/SDKs) — so in orchestrated
+  deployments the key can come from a secret manager and never appear in
+  process args or revision history
 - Or config file: `~/.config/token-optimizer/config.toml` (mode `0600`)
 - For systemd: use `EnvironmentFile=-/etc/tokan.env` (mode `0600`, owned by `tokan:tokan`)
+- On Azure Container Apps, `deploy/azure/main.bicep` wires both keys as
+  Key Vault references (user-assigned identity with read-only secret
+  access): the values never land in container args, `az containerapp
+  show`, or deployment history — only `@secure()` params and the vault
 
 ### Network Security
 

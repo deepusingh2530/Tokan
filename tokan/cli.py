@@ -312,7 +312,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--host", default="127.0.0.1")
         p.add_argument("--port", type=int, default=4040)
         p.add_argument("--upstream", default="https://api.openai.com/v1")
-        p.add_argument("--api-key", default=None, help="OpenAI-compatible upstream key")
+        p.add_argument("--api-key",
+                       default=os.environ.get("TOKAN_UPSTREAM_API_KEY"),
+                       help="OpenAI-compatible upstream key. Defaults to env "
+                            "TOKAN_UPSTREAM_API_KEY (namespaced on purpose: OPENAI_API_KEY "
+                            "is NOT read here, so an agent's exported key can never be "
+                            "silently repurposed as the gateway's upstream credential). "
+                            "Env-only deployments keep the key out of argv / revision "
+                            "history (e.g. Azure Key Vault secret references).")
         p.add_argument("--anthropic-upstream", default="https://api.anthropic.com")
         p.add_argument("--anthropic-api-key", default=None, help="Anthropic upstream key")
         p.add_argument("--gemini-upstream", default="https://generativelanguage.googleapis.com")

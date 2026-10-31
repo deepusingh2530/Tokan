@@ -279,7 +279,7 @@ Key ideas:
 | `--host` | `127.0.0.1` | Bind address. Keep local unless you intend to share on a LAN. |
 | `--port` | `4040` | Bind port. |
 | `--upstream` | `https://api.openai.com/v1` | OpenAI-compatible upstream base URL. |
-| `--api-key` | — | Key for the OpenAI-compatible upstream (also used for `--copilot` token). |
+| `--api-key` | env `TOKAN_UPSTREAM_API_KEY` | Key for the OpenAI-compatible upstream (also used for `--copilot` token). The env default is namespaced on purpose — `OPENAI_API_KEY` is *not* read, so an agent's exported key can't be silently repurposed as the gateway's upstream credential. Explicit flag always wins; useful for secret-manager injection (e.g. Key Vault references) where the key must stay out of argv. |
 | `--anthropic-upstream` | `https://api.anthropic.com` | Anthropic-native upstream. |
 | `--anthropic-api-key` | — | Anthropic key (if fronting real Anthropic). |
 | `--gemini-upstream` | `https://generativelanguage.googleapis.com` | Gemini-native upstream. |

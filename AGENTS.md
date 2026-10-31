@@ -57,7 +57,7 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `test_doc_governor.py` — _contract, _question, _post, _post_status, _get, _oracle_upstream, _make_server, _run, TestChunking, TestRetrieval, TestSummary, TestDocumentStore
 - `test_enterprise_layers.py` — Config, simple_function, long_method, Processor, AppComponent, TestASTIntegrity, TestASTFallback, TestEmbeddingCache, TestRoutingAccuracy, TestEnterpriseIntegration
 - `test_evidence.py` — _fixture_repo, TestRepoMatchScore, TestEvidenceDocOnly, TestEvidenceCrossStore
-- `test_gateway_auth.py` — _post, _post_status, _get, _get_status, _EchoUpstream, _run, _chat_payload, TestEnsureBindSafety, TestInboundAuth, TestSecretPosture, _doc_config, TestDocQualityGate
+- `test_gateway_auth.py` — _post, _post_status, _get, _get_status, _EchoUpstream, _run, _chat_payload, TestEnsureBindSafety, TestInboundAuth, TestSecretPosture, _doc_config, TestDocQualityGate, TestTaskRouter, TestUpstreamKeyFromEnv
 - `test_gemini_proxy.py` — FakeGeminiUpstream, TestGeminiProxy
 - `test_governor.py` — _Upstream, _conv, TestTokenBudget, TestContextWindowRegistry, TestClassification, TestSelection, TestDigestParity, TestWireBinding, TestSemanticCache, TestSemanticPipelineBinding, TestForwardPathE2E, TestMetricsAccounting
 - `test_jev.py` — TestJevRouter
@@ -129,4 +129,4 @@ Generated map of `Tokan` — structural index only; read files on demand.
 - `docs/ARCHITECTURE.md`
 - `extensions/vscode-tokan/README.md`
 
-<!-- 79/93 tracked files, 7848 bytes -->
+<!-- 84/99 tracked files, 8066 bytes -->

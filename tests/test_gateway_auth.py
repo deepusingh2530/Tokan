@@ -15,6 +15,7 @@ What is under test:
   only with an explicit --tier1-model.
 """
 import json
+import os
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -560,6 +561,54 @@ class TestTaskRouter(unittest.TestCase):
 
         _EchoUpstream.reset()
         _run(ProxyConfig(task_router=True, tier1_model="gpt-4o-mini"), fn)
+
+
+class TestUpstreamKeyFromEnv(unittest.TestCase):
+    """`serve` reads the upstream key from env (Key Vault injection path).
+
+    The point: deployments can supply the upstream credential via env only
+    (Azure Container Apps Key Vault `valueFrom` references), so the key never
+    appears in container args / revision history. Two safety properties:
+
+    * `--api-key` still wins over env (explicit beats default).
+    * `OPENAI_API_KEY` is deliberately NOT read — an agent's exported key
+      must never be repurposed as the gateway's upstream credential.
+    """
+
+    def _serve_args(self, argv, env, *, upstream_env=None):
+        """Parse serve argv under a controlled env for TOKAN_UPSTREAM_API_KEY.
+
+        `env` is applied on top; the real value of TOKAN_UPSTREAM_API_KEY is
+        forced to `upstream_env` (None = absent) so the test never depends on
+        the developer's shell.
+        """
+        from tokan.cli import build_parser
+        with mock.patch.dict("os.environ", env, clear=False):
+            if upstream_env is None:
+                os.environ.pop("TOKAN_UPSTREAM_API_KEY", None)
+            else:
+                os.environ["TOKAN_UPSTREAM_API_KEY"] = upstream_env
+            return build_parser().parse_args(argv)
+
+    def test_env_default_is_used_when_flag_absent(self):
+        args = self._serve_args(
+            ["serve"], {}, upstream_env="env-key-1")
+        self.assertEqual(args.api_key, "env-key-1")
+
+    def test_explicit_flag_beats_env(self):
+        args = self._serve_args(
+            ["serve", "--api-key", "flag-key"], {}, upstream_env="env-key-1")
+        self.assertEqual(args.api_key, "flag-key")
+
+    def test_openai_api_key_env_is_never_read(self):
+        # OPENAI_API_KEY set, TOKAN_UPSTREAM_API_KEY absent -> no key at all.
+        args = self._serve_args(
+            ["serve"], {"OPENAI_API_KEY": "agent-secret"}, upstream_env=None)
+        self.assertIsNone(args.api_key)
+
+    def test_no_env_means_no_key(self):
+        args = self._serve_args(["serve"], {}, upstream_env=None)
+        self.assertIsNone(args.api_key)
 
 
 if __name__ == "__main__":

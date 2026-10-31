@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "Tokan"
-version = "1.0.0"
+version = "1.0.1"
 description = "Universal token-optimization middleware for AI coding agents: CDM normalization, JeV routing, and a semantic edge cache."
 readme = "README.md"
 requires-python = ">=3.9"
