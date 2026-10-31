@@ -186,12 +186,53 @@ class CDMNormalizer:
             lines = head + [marker] + tail
         return "\n".join(self._elide_long_line(line) for line in lines)
 
-    def compact_text(self, text: str) -> str:
+    # Levels (the policy vocabulary, tokan.policy.CompressionLevel):
+    #   L1 lossless  — ANSI strip + trailing WS + blank runs only (meaning-safe)
+    #   L2 structured — + long-line elision + deterministic diff compaction
+    #   L3 redundancy — + head/tail tool truncation (tool blobs)
+    # Anything at/under L1 is guaranteed meaning-preserving, which is what lets
+    # the policy cap authoritative content (system/developer/tools) at L1.
+    def _lossless(self, text: str) -> str:
+        text = strip_ansi(text)
+        text = _TRAILING_WS_RE.sub("", text)
+        return _BLANK_RUN_RE.sub("\n\n", text).strip()
+
+    def compact_text(
+        self,
+        text: str,
+        *,
+        tool: bool = False,
+        level: Optional[int] = None,
+    ) -> str:
         """Noise-strip one text blob (ANSI, trailing WS, blank runs, elision).
 
         Public so wire adapters can compact payloads that don't arrive as
-        message lists — e.g. the Gemini API's per-part ``contents`` wire.
+        message lists — e.g. the Gemini API's per-part ``contents`` wire, or
+        the Responses API's typed ``input`` items.
+
+        ``tool=True`` applies the tool-output treatment instead (head/tail
+        kept, middle elided behind an explicit marker) — for wires that carry
+        tool results as opaque blobs rather than ``role: tool`` messages.
+
+        ``level`` (0–4) bounds the treatment for authority protection. It
+        defaults to today's behavior when ``None``:
+
+        * ``level <= 1``: lossless only — ANSI/whitespace normalization, no
+          diff compaction and no elision. Safe for instructions.
+        * ``level >= 2``: the full treatment below (default when ``None``).
+        * ``level <= 0``: bytes returned untouched.
+
+        ``tool`` still wins for the head/tail truncation when ``level >= 3``;
+        at ``level`` 1–2 tool blobs get only the lossless/structured treatment.
         """
+        if level is not None and level <= 0:
+            return text
+        if level is not None and level <= 1:
+            # Authority-capped: lossless normalization only. Never elide, never
+            # compact diffs — the model must see instructions verbatim.
+            return self._lossless(text)
+        if tool and (level is None or level >= 3):
+            return self._compact_tool_output(text)
         text = self._tidy(text)
         return "\n".join(self._elide_long_line(line) for line in text.splitlines())
 
@@ -215,13 +256,26 @@ class CDMNormalizer:
         return str(content)
 
     def normalize_messages(
-        self, messages: Sequence[Mapping[str, Any]], *, scrub: bool = False
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        scrub: bool = False,
+        policy: Optional["CompressionPolicy"] = None,
     ) -> List[Dict[str, Any]]:
         """Produce compact, deterministic messages (see class docstring).
 
         ``scrub=True`` additionally collapses *all* whitespace runs to single
         spaces. That variant is only used to derive cache digests — the
         forwarded payload keeps real structure (code indentation stays intact).
+
+        ``policy`` (a ``tokan.policy.CompressionPolicy``) enforces authority
+        protection on the *forwarded* text: system/developer instructions, tool
+        schemas and the user's constraints are capped at lossless L1, so no
+        elision or diff compaction ever rewrites content the model must obey.
+        When ``scrub=True`` the policy is ignored (the digest basis is
+        overridden by the caller's ``scrub_for_digest`` step, keeping cache keys
+        independent of the policy). When ``policy`` is ``None`` behavior is
+        unchanged from before the policy existed.
 
         Structured content (Anthropic ``tool_result`` blocks, image parts,
         multimodal arrays) is preserved verbatim when forwarding and only
@@ -236,10 +290,17 @@ class CDMNormalizer:
 
             if isinstance(content, str) or content is None:
                 text = self._content_to_text(content)
-                text = (
-                    self._compact_tool_output(text) if role == "tool" else self._tidy(text)
-                )
-                text = "\n".join(self._elide_long_line(line) for line in text.splitlines())
+                if policy is not None and not scrub:
+                    decision = policy.level_for(text, role=role, tool=(role == "tool"))
+                    level: Optional[int] = int(decision.level)
+                else:
+                    level = None
+                if role == "tool":
+                    text = self._compact_tool_output(text) if level is None or level >= 3 else (
+                        self._lossless(text) if level <= 1 else self._tidy(text)
+                    )
+                else:
+                    text = self.compact_text(text, level=level)
                 if scrub:
                     text = _WHITESPACE_RUN_RE.sub(" ", text).strip()
                 entry: Dict[str, Any] = {"role": role, "content": text}

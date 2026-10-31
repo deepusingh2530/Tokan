@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+extensions/**/node_modules
+extensions/**/out
+**/__pycache__
+**/*.pyc
+*.vsix
+deploy
+docs

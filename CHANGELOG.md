@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- **VS Code extension 0.2.1** — three fixes found while driving it against the
+  production gateway: (a) `tokan.authToken` is resource-scoped, and every
+  `getConfiguration('tokan')` call omitted the workspace scope, so VS Code
+  returned the default `''` and each `/metrics` poll failed with 401 (the
+  status bar read `offline` despite a correct token); all call sites now pass
+  the folder URI. (b) `build.sh` zipped the package at the archive root —
+  VS Code requires entries under `extension/`, so no `.vsix` produced by the
+  script was ever installable (`extension/package.json not found inside zip`);
+  the archive is also recreated from scratch so stale layouts can't leak in.
+  (c) activation overwrote an existing `.mcp.json` wholesale, which clobbered
+  a committed, sanitized example with a live gateway credential; it now merges
+  and never replaces a pre-existing `tokan` entry.
+
+## [1.0.1] - 2026-10-31
+
+Hardening patch driven by the first production deployment.
+
+- **`serve --api-key` can now come from the environment** (`TOKAN_UPSTREAM_API_KEY`)
+  as a default, matching the standalone proxy CLI's long-standing
+  `OPENAI_API_KEY` behavior. The variable is deliberately namespaced
+  (`OPENAI_API_KEY` is *not* read): an agent's exported key must never be
+  silently repurposed as the gateway's upstream credential, and an explicit
+  `--api-key` still beats the environment. This lets deployments inject the
+  upstream key via a Key Vault secret reference so the secret never appears
+  in container args / revision history. No-flag behavior is unchanged.
+
+## [1.0.0] - 2026-10-31
+
+First stable release. **Compatibility statement:** the provider wires
+(OpenAI / Anthropic / Gemini), the receipt schema (additive-only keys),
+`/metrics` and the CLI flags are stable surfaces from 1.0.0 — breaking
+changes will bump the major version. 456 tests pass.
+
+The milestone train M1–M6 (stacked PRs #6–#12, built on the
+`feature/enterprise-hybrid` base):
+
+- **M1 — Conversation memory foundation** (`tokan/memory.py`, PR #7):
+  append-only SQLite `ConversationStore`, deterministic `ConversationState`
+  extraction (no model calls), `ContextManifest` receipts; observe-only
+  behind `--conversation-db`, fail-open when storage is unavailable.
+- **M2 — Canonical request model** (`tokan/canonical.py`, PR #8): typed
+  `CanonicalRequest` with per-protocol round-trip; request `rid` on every
+  receipt; digest parity across OpenAI / Anthropic / Gemini / Responses
+  wires as a hard contract.
+- **M3 — Content classification + compression policy** (`tokan/policy.py`,
+  PR #9): typed content classes, authority tiers, L0–L4 compression levels;
+  system/developer instructions, tool schemas and the user's ask are capped
+  lossless — runtime features never change `record.digest`.
+- **M4 — Context Governor + Token Budget Controller** (`tokan/governor.py`,
+  PR #10): per-model windows, output reserve, utility-class shedding under
+  opt-in `--governor` (sheds counted in a separate ledger, never in
+  `tokens_saved`); conservative factual-only `--semantic-cache`.
+- **M5 — Repository + document intelligence v2** (PR #12): incremental
+  `SymbolCache` + `RepoGraph`, cross-store `EvidenceRetriever`, idf-weighted
+  `Document.coverage` with low-coverage abstention disclosure; doc Q&A
+  benchmark −87.8% prompt tokens with 8/8 gold-fact recall (labeled
+  synthetic) and 3/3 answer parity live.
+- **M6 — Hardening: inbound auth, secret hygiene, quality gate, routing**
+  (this release):
+  - **Inbound authentication:** `--api-keys` / `TOKAN_API_KEYS`; clients
+    present `Authorization: Bearer <key>` or `X-Optimizer-Api-Key: <key>`;
+    constant-time comparison, `/healthz` stays open for probes, 401 with
+    `WWW-Authenticate` and the key never echoed, failures counted
+    (`auth_failures`). A non-loopback bind without keys **refuses to
+    start** unless `--allow-insecure` acknowledges it (fail-closed).
+  - **Secret hygiene** (`tokan/secret.py`): detect-and-disclose by default —
+    ten *documented* credential formats (precision over recall), bytes
+    untouched, findings reported on receipts / metrics / dashboard.
+    Opt-in `--redact-secrets` replaces each finding with
+    `[REDACTED:<type>]` before canonicalization, the cache digest and the
+    upstream call, so no stored artifact can contain a secret; two payloads
+    differing only in secret material fingerprint to **one digest** (cache
+    keys never encode secrets). Scan capped at 2 MB per string value.
+  - **Quality gate:** `--doc-fallback-full` — when coverage says the
+    document likely cannot answer, send the **full document** instead of
+    weak excerpts (wrapped so CDM long-line protection cannot truncate it),
+    disclosed as `doc_fallback: "full_doc"` with honest accounting: savings
+    drop, that is the price of the guarantee.
+  - **Routing wire-up:** `--task-router` classifies each request into
+    tier_0/1/2 and discloses it (receipt `tier`, `/metrics` `tiers`,
+    `router_requests`); the model is rewritten **only** with an explicit
+    `--tier1-model` — never defaulted, so BYOK/plan-gated flows keep working.
+  - 35 new tests (`tests/test_secret.py`, `tests/test_gateway_auth.py`).
+
 ### Added
 - **Session Governor (Phase 1) — stable-prefix engineering for provider prompt
   caches.** Coding agents resend their full history every turn; providers

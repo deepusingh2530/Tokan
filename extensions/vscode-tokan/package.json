@@ -1,0 +1,64 @@
+{
+  "name": "vscode-tokan",
+  "displayName": "Tokan Gateway",
+  "description": "Points IDE traffic at your local Tokan token-optimization gateway and shows live ROI metrics in the status bar",
+  "version": "0.2.1",
+  "publisher": "tokan-enterprise",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tokan.exportTerminalEnv",
+        "title": "Tokan: Export Terminal Environment",
+        "category": "Tokan"
+      },
+      {
+        "command": "tokan.showMetrics",
+        "title": "Tokan: Show Metrics",
+        "category": "Tokan"
+      }
+    ],
+    "configuration": {
+      "title": "Tokan",
+      "properties": {
+        "tokan.gatewayUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4040/v1",
+          "description": "Tokan gateway endpoint (default: the local gateway from `token-optimizer serve`)"
+        },
+        "tokan.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Gateway API key (one of --api-keys / TOKAN_API_KEYS). Sent as X-Optimizer-Api-Key and Bearer on metrics/commands. Leave empty when the gateway runs without inbound auth (loopback default).",
+          "scope": "resource"
+        }
+      }
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "tokan.exportTerminalEnv",
+          "group": "0@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.140.0",
+    "typescript": "^5.9.3"
+  }
+}

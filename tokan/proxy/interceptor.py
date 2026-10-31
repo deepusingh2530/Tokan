@@ -23,19 +23,25 @@ Stdlib only — no third-party dependencies required to run the gateway.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import html
 import json
 import threading
+import textwrap
 import time
 import urllib.error
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from ..cdm import estimate_tokens
-from ..doc import DEFAULT_TOP_K, assemble_messages, full_resend_tokens
+from ..doc import DEFAULT_TOP_K, LOW_COVERAGE, assemble_messages, full_resend_tokens
+from .. import canonical
+from ..policy import CompressionPolicy
+from ..memory import ContextManifest, ConversationStore, content_digest
 from ..pipeline import OptimizationPipeline, PipelineResult, usage_cached_tokens, upstream_cached_tokens
 from ..session import SESSION_HEADER
 
@@ -158,6 +164,63 @@ class ProxyConfig:
     prompt_cache_key: bool = False
     #: How many receipts the /dashboard keeps in its rolling window.
     receipt_window: int = 500
+    #: Optional SQLite file for the append-only conversation store
+    #: (observe-only memory: records events + manifests, never serves them).
+    conversation_db: Optional[str] = None
+    # ----------------------------------------------------------- M6 hardening
+    #: Accepted inbound API keys (empty = no inbound auth, loopback-only by
+    #: default binding). Clients present one as ``Authorization: Bearer <key>``
+    #: or ``X-Optimizer-Api-Key: <key>``; comparisons are constant-time.
+    api_keys: Tuple[str, ...] = ()
+    #: Replace detected secrets with ``[REDACTED:<type>]`` before anything
+    #: leaves the machine (see tokan/secret.py). Off = detect-and-disclose.
+    redact_secrets: bool = False
+    #: Quality gate: when a doc question scores below the coverage threshold,
+    #: send the FULL document instead of weak excerpts (spends naive tokens on
+    #: purpose to protect answer quality). Off = excerpts + caveat only.
+    doc_fallback_full: bool = False
+    #: Classify each request into a routing tier (Adaptive Task Router) and
+    #: disclose it on receipts/headers. Model rewriting stays operator-driven.
+    task_router: bool = False
+    #: Explicit opt-in for Tier-1 model rewrites (never defaulted: rewriting
+    #: the model an agent asked for breaks BYOK/plan-gated flows unless the
+    #: operator owns both ends).
+    tier1_model: Optional[str] = None
+    # Context Governor and semantic answer cache (M4) live on the pipeline
+    # (see tokan/cli.py::_build_pipeline) — they act inside prepare(), not at
+    # the wire, so the config stays a transport concern only.
+
+
+#: Hosts that need no inbound auth (the OS loopback interface only).
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+
+#: Line width for full-document fallback sends. The CDM normalizer elides any
+#: single line over ~2000 chars (minified-bundle protection), so the whole
+#: document is wrapped first — otherwise a one-line document arrives
+#: truncated, which is the one thing --doc-fallback-full promises not to do.
+_FULL_DOC_LINE_CHARS = 1000
+
+
+def ensure_bind_safety(
+    host: str, api_keys: Sequence[str], *, allow_insecure: bool = False
+) -> None:
+    """Fail closed: a non-loopback bind needs inbound auth (M6).
+
+    Exposing an unauthenticated gateway to a network is the gateway's top
+    threat-model item: anyone who can reach it can spend the operator's
+    provider budget and read whatever context passes through. Binding off
+    loopback without keys therefore refuses to start unless the operator
+    explicitly acknowledges with ``allow_insecure``.
+    """
+    if allow_insecure or api_keys:
+        return
+    if host in _LOOPBACK_HOSTS or host.startswith("127."):
+        return
+    raise SystemExit(
+        f"refusing to bind non-loopback host {host!r} without inbound auth: "
+        "set --api-keys (or TOKAN_API_KEYS), or pass --allow-insecure to "
+        "acknowledge an open bind"
+    )
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -169,9 +232,66 @@ class _Handler(BaseHTTPRequestHandler):
     # Rolling per-request receipts (deque shared across handler instances);
     # None disables recording (direct-handler tests).
     receipts: Optional[Deque[Dict[str, Any]]] = None
+    # Adaptive Task Router (M6); None unless --task-router is configured.
+    _task_router: Optional[Any] = None
 
     def log_message(self, fmt: str, *args: Any) -> None:  # silence default stderr spam
         pass
+
+    # ------------------------------------------------------------------ auth
+    def _check_auth(self) -> bool:
+        """M6 inbound auth: enforce ``--api-keys`` when configured.
+
+        ``/healthz`` stays open (liveness probes must work unauthenticated);
+        every other path — including the dashboard and metrics, which leak
+        operational detail — requires a configured key, presented as
+        ``Authorization: Bearer <key>`` (also the credential-passthrough
+        shape, so a Copilot OAuth token can double as the gateway key) or
+        ``X-Optimizer-Api-Key: <key>``. Comparison is constant-time; the
+        presented key is never echoed. With no keys configured this is a
+        no-op — the loopback-only default (or ``ensure_bind_safety``) covers
+        that posture.
+        """
+        keys = self.config.api_keys
+        if not keys:
+            return True
+        if self.path in ("/healthz", "/health"):
+            return True
+        # Two candidate credentials: the bearer (which may legitimately be a
+        # passthrough *provider* credential in BYOK flows — Copilot OAuth
+        # tokens, OpenAI keys — so it is only one candidate, never the sole
+        # option) and the purpose-built X-Optimizer-Api-Key. Either matching
+        # a configured key admits the request.
+        presented = (self.headers.get("Authorization") or "").strip()
+        candidates = []
+        if presented.lower().startswith("bearer ") and presented[7:].strip():
+            candidates.append(presented[7:].strip())
+        optimizer_key = (self.headers.get("X-Optimizer-Api-Key") or "").strip()
+        if optimizer_key:
+            candidates.append(optimizer_key)
+        ok = False
+        for candidate in candidates:
+            for key in keys:
+                if hmac.compare_digest(candidate.encode("utf-8"), key.encode("utf-8")):
+                    ok = True
+        if not ok:
+            self.pipeline.metrics.record_auth_failure()
+            if self.config.log_requests:
+                print(
+                    f"{time.strftime('%H:%M:%S')} {self.path} 401 unauthorized",
+                    flush=True,
+                )
+            self._send_json(
+                401,
+                {"error": {
+                    "message": "unauthorized: send 'Authorization: Bearer <key>' "
+                               "or 'X-Optimizer-Api-Key: <key>' (gateway keys "
+                               "come from --api-keys / TOKAN_API_KEYS)",
+                    "type": "authentication_error",
+                }},
+                extra={"WWW-Authenticate": "Bearer"},
+            )
+        return ok
 
     # -------------------------------------------------------------- plumbing
     def _send_json(self, status: int, payload: Dict[str, Any], *, extra: Optional[Dict[str, str]] = None) -> None:
@@ -184,18 +304,24 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _route_headers(self, result: PipelineResult) -> Dict[str, str]:
+    def _route_headers(
+        self, result: PipelineResult, *, secrets_redacted: int = 0
+    ) -> Dict[str, str]:
         out = {
             "X-Optimizer-Route": result.decision.route,
             "X-Optimizer-Saved-Tokens": str(result.record.saved_tokens),
             "X-Optimizer-Saved-Percent": str(result.record.saved_pct),
             "X-Optimizer-Digest": result.record.digest[:16],
         }
+        # M6: tell the client when secrets were replaced before forwarding.
+        if secrets_redacted:
+            out["X-Optimizer-Secrets-Redacted"] = str(secrets_redacted)
         # Doc Governor: disclose the retrieval economics on every response
         # (including streams, whose body is SSE chunks we don't rewrite).
         ds = result.doc_savings
         if ds:
-            sent = 0 if result.decision.route in ("cache", "local") else result.record.canonical_tokens
+            # Semantic hits serve from the answer cache too — zero bytes out.
+            sent = 0 if result.decision.route in ("cache", "local", "semantic") else result.record.canonical_tokens
             avoided = max(0, int(ds.get("full_tokens", 0)) - sent)
             out["X-Optimizer-Doc-Id"] = str(ds.get("doc_id", ""))
             out["X-Optimizer-Doc-Avoided-Tokens"] = str(avoided)
@@ -213,6 +339,11 @@ class _Handler(BaseHTTPRequestHandler):
         upstream_ms: float = 0.0,
         upstream_cached: int = 0,
         fallback: str = "",
+        protocol: str = "openai",
+        response_text: str = "",
+        tier: str = "",
+        secrets_detected: int = 0,
+        secrets_redacted: int = 0,
     ) -> None:
         """One line of truth per request: route, tokens, latency, disclosures.
 
@@ -233,8 +364,8 @@ class _Handler(BaseHTTPRequestHandler):
         # resend (what the client would have paid without retrieval).
         ds = result.doc_savings
         original = int(ds.get("full_tokens", 0)) if ds else result.record.original_tokens
-        # What actually left the machine: cache/local hits send nothing.
-        sent = 0 if route in ("cache", "local") else result.record.canonical_tokens
+        # What actually left the machine: cache/local/semantic hits send nothing.
+        sent = 0 if route in ("cache", "local", "semantic") else result.record.canonical_tokens
         saved_pct = round(100.0 * (original - sent) / original, 2) if original else 0.0
         overhead = max(0.0, ms - upstream_ms)
         pr = result.prefix_reuse
@@ -261,6 +392,38 @@ class _Handler(BaseHTTPRequestHandler):
             "doc_id": ds.get("doc_id", "") if ds else "",
             "fallback": fallback,
         }
+        # M5 doc-ask quality disclosure — additive keys, and only on doc
+        # receipts, so every other receipt stays byte-identical.
+        if ds and ds.get("coverage") is not None:
+            rec["coverage"] = ds["coverage"]
+            rec["low_coverage"] = bool(ds.get("low_coverage", False))
+        # M6 disclosures — additive too: requests with no secrets, no
+        # fallback and no router run produce byte-identical receipts.
+        if ds and ds.get("fallback"):
+            rec["doc_fallback"] = ds["fallback"]
+        if tier:
+            rec["tier"] = tier
+        if secrets_detected:
+            rec["secrets_detected"] = secrets_detected
+        if secrets_redacted:
+            rec["secrets_redacted"] = secrets_redacted
+        # Context Governor (M4): budget decision, only when the governor ran.
+        # Additive keys — a governor-off receipt is byte-identical to M3's.
+        plan = result.governor_plan
+        if plan is not None:
+            rec["governor"] = plan.as_dict()
+        if result.semantic:
+            # Fuzzy answer reuse — surfaced separately from the digest cache.
+            rec["semantic"] = True
+        # Conversation memory: a request id ties receipt, manifest and events
+        # together. Only added when the store is on, so flag-off receipts stay
+        # byte-identical to prior releases.
+        # Request id ties receipt, manifest and stored events together. Added
+        # unconditionally since M2 (additive key — existing consumers read
+        # specific receipt fields, so this is backward compatible).
+        rec["rid"] = hashlib.sha256(
+            f"{rec['ts']}|{rec['digest']}|{self.path}".encode("utf-8")
+        ).hexdigest()[:16]
         self.receipts.append(rec)
         if self.config.log_requests:
             line = (
@@ -274,14 +437,190 @@ class _Handler(BaseHTTPRequestHandler):
                 line += f" prefix_reuse={prefix_reused}"
             if ds:
                 line += f" doc={ds['doc_id']} avoided={max(0, original - sent)}tok"
+                if ds.get("low_coverage"):
+                    line += f" coverage={ds.get('coverage', 0)}(LOW)"  # M5 quality flag
+                elif ds.get("coverage") is not None:
+                    line += f" coverage={ds['coverage']}"
+                if ds.get("fallback"):
+                    line += f" doc_fallback={ds['fallback']}"  # M6 quality gate
+            if rec.get("tier"):
+                line += f" tier={rec['tier']}"  # M6 routing disclosure
+            if rec.get("secrets_detected"):
+                line += (
+                    f" secrets={rec['secrets_detected']}"
+                    + (f"(redacted {rec['secrets_redacted']})" if rec.get("secrets_redacted") else "")
+                )
             if upstream_cached:
                 line += f" upstream_cache={upstream_cached} ({cache_ratio:.0%})"
             if fallback:
                 line += f" fallback={fallback}"
+            if plan is not None and plan.applied:
+                line += f" shed={plan.shed_tokens}tok/{plan.shed_units}u"
+            if result.semantic:
+                line += " semantic_hit"
+            # Cache-miss diagnosis: which conversation part changed the digest.
+            # Two "identical" asks that log different part hashes (or different
+            # scope values) are genuinely different canonical payloads.
+            parts = ",".join(
+                hashlib.sha1(
+                    json.dumps(m, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+                ).hexdigest()[:6]
+                for m in result.messages
+            )
+            scope_bits = "".join(
+                f" {k}={str(payload[k])[:32]}" for k in ("user", "temperature", "top_p") if payload.get(k) is not None
+            )
+            line += f" digest={rec['digest']} parts=[{parts}]{scope_bits}"
+            if result.volatile_scrubbed:
+                line += f" devol={result.volatile_scrubbed}"
+            # Log-only conversation preview (truncated): shows what each
+            # canonical message actually says — the fastest way to spot a
+            # client injecting per-thread noise. Never exposed on the wire.
+            prev = []
+            for i, m in enumerate(result.messages[:12]):
+                c = m.get("content")
+                if not isinstance(c, str):
+                    c = json.dumps(c, ensure_ascii=False, default=str)
+                if i < 3 and len(c) > 120:
+                    # Leading messages carry client-injected preambles; show
+                    # head+tail so per-thread volatile ids are visible.
+                    prev.append(f"{m.get('role', '?')}:{c[:160]}…{c[-80:]}")
+                else:
+                    prev.append(f"{m.get('role', '?')}:{c[:40]}")
+            line += f" convo=[{' | '.join(prev)}{' ...' if len(result.messages) > 12 else ''}]"
             print(line, flush=True)
+            # One line per message (own log line, so Azure's per-line cap can't
+            # hide the middle of the payload): role, length, sha and head.
+            # This is how client-injected per-thread noise gets identified.
+            for i, m in enumerate(result.messages[:16]):
+                c = m.get("content")
+                if not isinstance(c, str):
+                    c = json.dumps(c, ensure_ascii=False, default=str)
+                print(f"    m[{i}] {m.get('role', '?')} len={len(c)} sha={hashlib.sha1(c.encode('utf-8')).hexdigest()[:6]} head={c[:80]!r} tail={c[-60:]!r}", flush=True)
+        self._observe(
+            payload, result, route=route, status=status, protocol=protocol,
+            rid=rec.get("rid", ""), response_text=response_text,
+        )
+
+    # ------------------------------------------------------------- observer
+    def _observe(
+        self,
+        payload: Dict[str, Any],
+        result: PipelineResult,
+        *,
+        route: str,
+        status: int,
+        protocol: str,
+        rid: str,
+        response_text: str = "",
+    ) -> None:
+        """Observe-only conversation memory (design principle: recoverability).
+
+        Appends the request's newest message (extracted from the *original*
+        payload — the store keeps real bytes, not the digest-scrubbed view),
+        the assistant's answer when known, and a context manifest. Never alters
+        the request or response; every failure is swallowed so storage can
+        never affect serving.
+
+        Resend dedupe: agent clients re-send the whole history each turn, so a
+        request whose last message equals the stored last message event appends
+        nothing new — only genuinely new turns are recorded.
+        """
+        store = self.store
+        if store is None:
+            return
+        try:
+            conv = (
+                (self.headers.get(SESSION_HEADER) or "").strip()
+                or (result.prefix_reuse.session_key if result.prefix_reuse else "")
+            )
+            if not conv:
+                return
+            last = _last_payload_message(payload, protocol)
+            if last is not None:
+                role, text = last
+                content = {"role": role, "text": text}
+                # Dedupe against the last message event *of the same role*:
+                # agent clients re-send whole histories, so a verbatim retry
+                # (or a cache-hit re-serve of the same turn) records nothing
+                # new, while genuinely new turns do. The digest basis MUST be
+                # memory.content_digest — the store's canonical JSON encoding.
+                prev = store.last_message(conv, source=role)
+                if prev is None or prev.digest != content_digest(content):
+                    store.append(conv, source=role, kind="message", content=content)
+            if response_text:
+                answer_content = {"text": response_text}
+                prev_answer = store.last_message(conv, source="assistant")
+                if prev_answer is None or prev_answer.digest != content_digest(answer_content):
+                    store.append(
+                        conv, source="assistant", kind="message", content=answer_content
+                    )
+            # Canonical-model stats: exercise the typed parse on real traffic
+            # (M2) so its fidelity is observed in production manifests — the
+            # governor (M3) consumes the same parse.
+            canonical_stats: Dict[str, int] = {}
+            try:
+                req = canonical.parse(payload, protocol=protocol)
+                canonical_stats = {
+                    "messages": len(req.messages),
+                    "tools": len(req.tools),
+                    "parts": sum(len(m.parts) for m in req.messages),
+                    "extensions": len(req.extensions),
+                }
+            except Exception:
+                pass  # manifest still records; canonical stats are best-effort
+            manifest = ContextManifest(
+                rid=rid,
+                conversation=conv,
+                ts=time.time(),
+                protocol=protocol,
+                route=route,
+                status=status,
+                model=str(payload.get("model", "")),
+                digest=result.record.digest[:16],
+                original_tokens=result.record.original_tokens,
+                optimized_tokens=(
+                    0 if route in ("cache", "local", "semantic")
+                    else result.record.canonical_tokens
+                ),
+                cache_hit=bool(result.cached),
+                volatile_scrubbed=int(result.volatile_scrubbed),
+                prefix_reused=(
+                    result.prefix_reuse.reused_tokens if result.prefix_reuse else 0
+                ),
+                protected={
+                    "system_messages": sum(
+                        1 for m in result.messages if m.get("role") == "system"
+                    )
+                },
+                included={"messages": len(result.messages)},
+                compressed=(
+                    {"devolatilized": int(result.volatile_scrubbed)}
+                    if result.volatile_scrubbed
+                    else {}
+                ),
+                # Context Governor (M4): the budget decision, and exactly which
+                # message indices were withheld from the provider. Empty when
+                # the request fit its window — the common case.
+                omitted=(
+                    [str(i) for i in result.governor_plan.shed]
+                    if result.governor_plan and result.governor_plan.shed
+                    else []
+                ),
+                governor=(
+                    result.governor_plan.as_dict() if result.governor_plan else {}
+                ),
+                canonical=canonical_stats,
+            )
+            store.append(conv, source="optimization", kind="manifest", content=manifest.as_dict())
+        except Exception as exc:  # fail open — memory is never in the hot path
+            if self.config.log_requests:
+                print(f"[tokan] conversation observer skipped: {exc}", flush=True)
 
     # ---------------------------------------------------------------- routes
     def do_GET(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
         if self.path in ("/healthz", "/health"):
             self._send_json(200, {"ok": True, "service": "token-optimizer"})
         elif self.path in ("/models", "/v1/models"):
@@ -293,8 +632,15 @@ class _Handler(BaseHTTPRequestHandler):
                 {
                     "session": self.pipeline.metrics.as_dict(),
                     "cache": self.pipeline.cache.stats(),
+                    # M6 routing: per-tier classification counts (populated
+                    # only when --task-router is on; empty otherwise).
+                    "tiers": self.pipeline.metrics.tiers,
                 },
             )
+        elif self.path in ("/receipts", "/v1/receipts"):
+            # Rolling receipt window as JSON — the same rows the dashboard
+            # renders, for tooling and cache-miss diagnosis.
+            self._send_json(200, {"receipts": list(self.receipts)})
         elif self.path in ("/dashboard", "/v1/dashboard"):
             self._dashboard()
         else:
@@ -351,7 +697,7 @@ class _Handler(BaseHTTPRequestHandler):
  table {{ border-collapse:collapse; width:100%; margin-top:.5rem; }}
  th,td {{ padding:.3rem .6rem; border-bottom:1px solid #21262d; text-align:left; }}
  th {{ color:#8b949e; font-size:11px; text-transform:uppercase; }}
- .rt-cache {{ color:#3fb950; }} .rt-local {{ color:#58a6ff; }} .rt-llm {{ color:#d29922; }}
+ .rt-cache {{ color:#3fb950; }} .rt-local {{ color:#58a6ff; }} .rt-llm {{ color:#d29922; }} .rt-semantic {{ color:#bc8cff; }}
  .empty {{ color:#8b949e; font-style:italic; }}
  .lat {{ color:#8b949e; font-size:11px; white-space:nowrap; }}
 </style></head><body>
@@ -359,6 +705,10 @@ class _Handler(BaseHTTPRequestHandler):
 <div class="cards">
  <div class="card"><div class="k">Requests</div><div class="v">{esc(m['requests'])}</div></div>
  <div class="card"><div class="k">Cache hits</div><div class="v">{esc(m['cache_hits'])}</div></div>
+ <div class="card"><div class="k">Semantic hits</div><div class="v" title="Near-identical questions served from the answer cache (fuzzy reuse — separate from exact digest hits)">{esc(m.get('semantic_cache_hits', 0))}</div></div>
+ <div class="card"><div class="k">Governor sheds</div><div class="v" title="Requests where context was shed to fit the model's window (never instructions, schemas or the ask)">{esc(m.get('governor_sheds', 0))}</div></div>
+ <div class="card"><div class="k">Shed tokens</div><div class="v" title="Estimated tokens withheld from the provider to fit the window (our estimate — not counted in Tokens saved)">{esc(m.get('governor_shed_tokens', 0))}</div></div>
+ <div class="card"><div class="k">Overflows</div><div class="v" title="Requests whose required context alone exceeded the window (forwarded unchanged; provider decides)">{esc(m.get('governor_overflows', 0))}</div></div>
  <div class="card"><div class="k">Local solves</div><div class="v">{esc(m['local_solves'])}</div></div>
  <div class="card"><div class="k">LLM calls</div><div class="v">{esc(m['llm_calls'])}</div></div>
  <div class="card"><div class="k">Tokens saved</div><div class="v">{esc(m['tokens_saved'])}</div></div>
@@ -369,6 +719,12 @@ class _Handler(BaseHTTPRequestHandler):
  <div class="card"><div class="k">Docs</div><div class="v" title="Documents ingested — stored once, reused by every question">{esc(m.get('doc_ingests', 0))}</div></div>
  <div class="card"><div class="k">Doc Q&amp;A</div><div class="v" title="Document questions answered from summary + retrieved excerpts">{esc(m.get('doc_questions', 0))}</div></div>
  <div class="card"><div class="k">Doc avoided</div><div class="v" title="Tokens never sent because retrieval replaced the full-document resend (baseline = whole doc + question)">{esc(m.get('doc_tokens_avoided', 0))}</div></div>
+ <div class="card"><div class="k">Low coverage</div><div class="v" title="Doc Q&As whose question outran the document's vocabulary — the answer may not be supported (M5)">{esc(m.get('doc_low_coverage', 0))}</div></div>
+ <div class="card"><div class="k">Evidence</div><div class="v" title="Ranked evidence searches served across ingested documents (M5)">{esc(m.get('evidence_searches', 0))}</div></div>
+ <div class="card"><div class="k">Full-doc fallbacks</div><div class="v" title="Low-coverage doc asks sent the full document on purpose — quality protected, tokens spent (M6)">{esc(m.get('doc_full_fallbacks', 0))}</div></div>
+ <div class="card"><div class="k">Secrets found</div><div class="v" title="Credential-shaped spans detected in request payloads (M6)">{esc(m.get('secrets_detected', 0))}</div></div>
+ <div class="card"><div class="k">Secrets redacted</div><div class="v" title="Secrets replaced before leaving the machine (--redact-secrets; M6)">{esc(m.get('secrets_redacted', 0))}</div></div>
+ <div class="card"><div class="k">Auth failures</div><div class="v" title="Requests rejected for missing/invalid API keys (M6)">{esc(m.get('auth_failures', 0))}</div></div>
  <div class="card"><div class="k">Fallbacks</div><div class="v">{esc(m['fallbacks'])}</div></div>
  <div class="card"><div class="k">Cache entries</div><div class="v">{esc(c['entries'])}</div></div>
  <div class="card"><div class="k">Hit rate</div><div class="v">{esc(c['hit_rate'])}</div></div>
@@ -386,12 +742,15 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._check_auth():
+            return
         protocol, endpoint = self._classify(self.path)
         # Doc Governor extensions are Tokan's own endpoints, not provider
         # wires — recognized before the protocol classifier 404s them.
         is_ingest = self.path in ("/v1/ingest", "/ingest")
         is_doc_ask = self.path in ("/v1/doc/ask", "/doc/ask")
-        if protocol is None and not (is_ingest or is_doc_ask):
+        is_evidence = self.path in ("/v1/evidence", "/evidence")
+        if protocol is None and not (is_ingest or is_doc_ask or is_evidence):
             self._send_json(404, {"error": {"message": f"unknown path {self.path}", "type": "invalid_request_error"}})
             return
         try:
@@ -402,8 +761,34 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": {"message": "invalid JSON body", "type": "invalid_request_error"}})
             return
 
+        # M6 secret posture: every payload (chat, doc-ask, ingest, evidence)
+        # is scanned. Default = detect-and-disclose (bytes untouched);
+        # --redact-secrets replaces each finding with a typed placeholder
+        # before anything leaves — before canonicalization, the cache digest
+        # and the upstream call, so no secret can enter any stored artifact.
+        secrets_detected = 0
+        secrets_redacted = 0
+        if self.config.redact_secrets:
+            from ..secret import redact_payload
+
+            payload, redacted = redact_payload(payload)
+            secrets_redacted = sum(redacted.values())
+            secrets_detected = secrets_redacted
+        else:
+            from ..secret import count_payload_secrets
+
+            secrets_detected = sum(count_payload_secrets(payload).values())
+        if secrets_detected:
+            self.pipeline.metrics.record_secrets(
+                detected=secrets_detected, redacted=secrets_redacted
+            )
+
         if is_ingest:
             self._handle_ingest(payload)
+            return
+
+        if is_evidence:
+            self._handle_evidence(payload)
             return
 
         doc_savings: Optional[Dict[str, Any]] = None
@@ -415,6 +800,17 @@ class _Handler(BaseHTTPRequestHandler):
             # Retrieval produces a standard OpenAI-wire prompt; everything
             # downstream (cache, receipts, fallback, session) just runs.
             protocol, endpoint = "openai", "chat"
+
+        # M6 routing (opt-in): classify the request into a complexity tier
+        # and disclose it. Model rewriting happens ONLY when the operator
+        # explicitly set --tier1-model — never by default: rewriting the
+        # model an agent asked for breaks BYOK/plan-gated flows.
+        tier = ""
+        if self.config.task_router and self._task_router is not None:
+            tier = self._task_router.get_tier(payload.get("messages") or [], payload=payload)
+            self.pipeline.metrics.record_tier(tier)
+            if self.config.tier1_model and tier == "tier_1":
+                payload = self._task_router.rewrite_payload(payload, tier)
 
         if endpoint == "count_tokens":
             # Anthropic bookkeeping endpoint — answer locally, zero tokens.
@@ -428,14 +824,32 @@ class _Handler(BaseHTTPRequestHandler):
         session_key = (self.headers.get(SESSION_HEADER) or "").strip() or None
         if doc_savings is not None:
             session_key = f"doc:{doc_savings['doc_id']}"
-        result = self.pipeline.prepare(payload, protocol=protocol, session_key=session_key)
+        # M3 compression policy: authority-protection in force for forwarded
+        # text. System/developer instructions, tool schemas and the user's ask
+        # are capped at lossless L1; only NORMAL/LOW content reaches L2/L3.
+        # The digest/prefix basis ignores this, so it never changes a cache key.
+        policy = CompressionPolicy()
+        result = self.pipeline.prepare(
+            payload, protocol=protocol, endpoint=endpoint,
+            session_key=session_key, policy=policy,
+        )
+        # Context Governor (M4): book the outcome. Under budget this is a
+        # no-op; when context was shed (or required context alone overflowed)
+        # the counters make it visible without touching tokens_saved.
+        plan = result.governor_plan
+        if plan is not None and (plan.applied or plan.overflow):
+            self.pipeline.metrics.record_governor(
+                shed_tokens=plan.shed_tokens, overflow=plan.overflow
+            )
         if doc_savings is not None:
             result.doc_savings = doc_savings
 
         # 1) Cache hit / deterministic local answer: zero upstream tokens.
+        # Every wire gets its own response shape — including Responses API.
         if result.can_serve_locally:
             response = self.pipeline.serve_local(
-                result, model=str(payload.get("model", "optimizer-local")), protocol=protocol
+                result, model=str(payload.get("model", "optimizer-local")),
+                protocol=protocol, endpoint=endpoint,
             )
             if doc_savings is not None:
                 response["optimizer"] = self._doc_meta(result)
@@ -445,15 +859,52 @@ class _Handler(BaseHTTPRequestHandler):
                     self._stream_local_anthropic(response)
                 elif protocol == "gemini":
                     self._stream_local_gemini(response)
+                elif endpoint == "responses":
+                    self._stream_local_responses(response)
                 else:
                     self._stream_local(response)
-            else:
-                self._send_json(200, response, extra=self._route_headers(result))
+                self._record_receipt(
+                    payload, result,
+                    route=("semantic" if result.semantic else result.decision.route),
+                    status=200,
+                    ms=(time.perf_counter() - started) * 1000,
+                    upstream_ms=0.0,
+                    protocol=protocol,
+                    tier=tier,
+                    secrets_detected=secrets_detected,
+                    secrets_redacted=secrets_redacted,
+                    response_text=(
+                        result.local_answer
+                        or (result.cached_value if isinstance(result.cached_value, str) else "")
+                    ),
+                )
+                return
+            # Record BEFORE responding (streams record after their relay,
+            # which IS the response). With the threaded gateway, sending
+            # first lets a concurrent follow-up request record its receipt
+            # before this one — the receipt log must stay in completion
+            # order so "the last receipt is my request" always holds.
             self._record_receipt(
                 payload, result,
-                route=result.decision.route, status=200,
+                # A semantic hit is a fuzzy reuse, not an exact digest repeat —
+                # book it under its own route so the dashboard's cache-hit
+                # rate stays honest.
+                route=("semantic" if result.semantic else result.decision.route),
+                status=200,
                 ms=(time.perf_counter() - started) * 1000,
                 upstream_ms=0.0,
+                protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
+                response_text=(
+                    result.local_answer
+                    or (result.cached_value if isinstance(result.cached_value, str) else "")
+                ),
+            )
+            self._send_json(
+                200, response,
+                extra=self._route_headers(result, secrets_redacted=secrets_redacted),
             )
             return
 
@@ -461,6 +912,9 @@ class _Handler(BaseHTTPRequestHandler):
         self._forward(
             payload, result, protocol=protocol, endpoint=endpoint,
             started=started,
+            tier=tier,
+            secrets_detected=secrets_detected,
+            secrets_redacted=secrets_redacted,
         )
 
     @staticmethod
@@ -468,6 +922,10 @@ class _Handler(BaseHTTPRequestHandler):
         """Map a request path to (protocol, endpoint)."""
         if path in ("/v1/chat/completions", "/chat/completions"):
             return "openai", "chat"
+        if path in ("/v1/responses", "/responses"):
+            # OpenAI Responses API (gpt-5/codex models that don't serve
+            # chat/completions) — forwarded with the same wire shape.
+            return "openai", "responses"
         if path in ("/v1/messages", "/messages"):
             return "anthropic", "messages"
         if path in ("/v1/messages/count_tokens", "/messages/count_tokens"):
@@ -536,6 +994,62 @@ class _Handler(BaseHTTPRequestHandler):
             "next": 'POST /v1/doc/ask {"doc_id": "...", "question": "...", "model": "..."}',
         })
 
+    def _handle_evidence(self, payload: Dict[str, Any]) -> None:
+        """``POST /v1/evidence`` — ranked evidence units over *ingested docs only*.
+
+        Security boundary (M5): this endpoint is served over unauthenticated
+        HTTP, so it never walks the filesystem — repo-graph evidence is
+        available through the MCP ``evidence`` tool (agent-local trust, same
+        as ``repo_index``) and the CLI, not here. Docs-only keeps the surface
+        equivalent to what ``/v1/ingest`` already exposed.
+
+        Scoring honesty: each unit carries its store-native score (TF-IDF
+        cosine for docs) and ``source``; no cross-store calibration is claimed.
+        """
+        query = str(payload.get("query") or "").strip()
+        if not query:
+            self._send_json(400, {
+                "error": {"message": "missing 'query' — POST {\"query\": \"...\"} "
+                                     "(optional: top_k, doc_ids[])",
+                          "type": "invalid_request_error"},
+            })
+            return
+        try:
+            top_k = int(payload.get("top_k") or 5)
+        except (TypeError, ValueError):
+            top_k = 5
+        top_k = max(1, min(20, top_k))
+        doc_ids = payload.get("doc_ids")
+        if doc_ids is not None and not isinstance(doc_ids, list):
+            self._send_json(400, {
+                "error": {"message": "'doc_ids' must be a list of doc ids",
+                          "type": "invalid_request_error"},
+            })
+            return
+
+        from ..evidence import EvidenceRetriever
+
+        retriever = EvidenceRetriever(self.pipeline.documents)  # no graph: docs only
+        units = retriever.search(query, top_k=top_k, doc_ids=doc_ids)
+        self.pipeline.metrics.record_evidence(len(units))
+        if self.config.log_requests:
+            print(
+                f"{time.strftime('%H:%M:%S')} POST /v1/evidence "
+                f"query={query[:40]!r} units={len(units)} "
+                f"tokens={sum(u.tokens for u in units)}",
+                flush=True,
+            )
+        self._send_json(200, {
+            "query": query,
+            "units": [u.as_dict() for u in units],
+            "count": len(units),
+            "tokens": sum(u.tokens for u in units),
+            # Disclosed, not hidden: repo evidence lives behind MCP/CLI only.
+            "scopes": ["doc"],
+            "note": "repo-symbol evidence is served by the MCP 'evidence' tool "
+                    "(and CLI), not over unauthenticated HTTP",
+        })
+
     def _assemble_doc_ask(
         self, payload: Dict[str, Any]
     ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
@@ -581,6 +1095,30 @@ class _Handler(BaseHTTPRequestHandler):
         top_k = max(1, min(10, top_k))
 
         messages, idxs, chunks = assemble_messages(doc, question, top_k=top_k)
+        coverage = round(doc.coverage(question), 3)  # M5: O(question), no retrieval
+        low_coverage = coverage < LOW_COVERAGE
+        full_fallback = False
+        if low_coverage and self.config.doc_fallback_full:
+            # M6 quality gate: retrieval is demonstrably weak for this
+            # question (its vocabulary barely appears in the document), so
+            # spend the naive full-document tokens rather than risk an
+            # answer the excerpts cannot support. The system instruction
+            # keeps its abstention caveat — honest even with everything
+            # attached: if the document truly cannot answer, the model says
+            # so instead of inventing. Accounting stays honest too: this ask
+            # saves ~nothing; that is the price of the guarantee.
+            #
+            # Wrap before sending (same reason as summarize()): the CDM
+            # normalizer elides any single line longer than ~2k chars, and a
+            # one-line document would otherwise arrive *truncated* — the one
+            # thing this flag promises not to do. Wrapping is whitespace only.
+            full_text = textwrap.fill(doc.text, width=_FULL_DOC_LINE_CHARS)
+            messages = [
+                messages[0],
+                {"role": "user", "content": f"{full_text}\n\nQuestion: {question}"},
+            ]
+            idxs, chunks = [], []
+            full_fallback = True
         assembled: Dict[str, Any] = {"model": model, "messages": messages}
         for key in ("temperature", "top_p", "max_tokens", "max_completion_tokens", "user"):
             if key in payload:
@@ -595,17 +1133,26 @@ class _Handler(BaseHTTPRequestHandler):
             "chunks_used": len(chunks),
             "retrieved": [i + 1 for i in idxs],  # 1-based, as numbered in the prompt
             "question_tokens": estimate_tokens(question),
+            # M5 coverage: honest disclosure of how much of the question's
+            # vocabulary the document can even speak to. Low coverage does not
+            # change the route (no fabricated "cannot find it" local answer) —
+            # it strengthens the abstention instruction and gets disclosed.
+            "coverage": coverage,
+            "low_coverage": low_coverage,
         }
+        if full_fallback:
+            doc_savings["fallback"] = "full_doc"
+            doc_savings["full_fallback"] = True
         return assembled, doc_savings
 
     @staticmethod
     def _doc_meta(result: PipelineResult) -> Dict[str, Any]:
         """The ``optimizer`` block attached to doc-ask response bodies."""
         ds = result.doc_savings or {}
-        sent = 0 if result.decision.route in ("cache", "local") else result.record.canonical_tokens
+        sent = 0 if result.decision.route in ("cache", "local", "semantic") else result.record.canonical_tokens
         full = int(ds.get("full_tokens", 0))
         avoided = max(0, full - sent)
-        return {
+        meta: Dict[str, Any] = {
             "mode": "doc",
             "doc_id": ds.get("doc_id", ""),
             "route": result.decision.route,
@@ -615,7 +1162,15 @@ class _Handler(BaseHTTPRequestHandler):
             "sent_tokens": sent,          # what Tokan actually forwarded
             "tokens_avoided": avoided,
             "avoided_pct": round(100.0 * avoided / full, 2) if full else 0.0,
+            # M5: how much of the question the document can speak to, disclosed
+            # even when healthy — a caller comparing receipts can see quality.
+            "coverage": ds.get("coverage"),
+            "low_coverage": bool(ds.get("low_coverage", False)),
         }
+        # M6 quality gate: only present when the full-document fallback fired.
+        if ds.get("fallback"):
+            meta["doc_fallback"] = ds["fallback"]
+        return meta
 
     # -------------------------------------------------------------- local out
     def _stream_local(self, response: Dict[str, Any]) -> None:
@@ -665,6 +1220,39 @@ class _Handler(BaseHTTPRequestHandler):
         for event, data in events:
             parts.append(f"event: {event}\ndata: {json.dumps(data)}\n\n")
         body = "".join(parts).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _stream_local_responses(self, response: Dict[str, Any]) -> None:
+        """Full Responses-API event sequence for a locally-served answer.
+
+        Cache/local hits for streaming Responses clients (Copilot BYOK) emit
+        the same bookend events the provider would — created → output item →
+        text deltas → completed — so the client renders the cached answer
+        without the gateway ever contacting the model.
+        """
+        item = response["output"][0]
+        text = item["content"][0]["text"]
+        in_progress = {**response, "status": "in_progress"}
+        events = [
+            ("response.created", {"type": "response.created", "response": in_progress}),
+            ("response.in_progress", {"type": "response.in_progress", "response": in_progress}),
+            ("response.output_item.added", {"type": "response.output_item.added",
+                                            "output_index": 0, "item": {**item, "status": "in_progress"}}),
+            ("response.output_text.delta", {"type": "response.output_text.delta",
+                                            "item_id": item["id"], "output_index": 0,
+                                            "content_index": 0, "delta": text}),
+            ("response.output_text.done", {"type": "response.output_text.done",
+                                           "item_id": item["id"], "output_index": 0,
+                                           "content_index": 0, "text": text}),
+            ("response.output_item.done", {"type": "response.output_item.done",
+                                           "output_index": 0, "item": item}),
+            ("response.completed", {"type": "response.completed", "response": response}),
+        ]
+        body = "".join(f"event: {event}\ndata: {json.dumps(data)}\n\n" for event, data in events).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Content-Length", str(len(body)))
@@ -729,6 +1317,75 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _compact_responses_input(self, input_value: Any, result: PipelineResult) -> Any:
+        """Noise-strip text parts on the Responses wire, preserving item shape.
+
+        Message items get their text parts compacted (ANSI, trailing whitespace,
+        blank runs, diff-context and long-line elision — the same treatment the
+        chat wire's messages get); exact-repeat ``function_call_output`` items
+        collapse to an explicit marker so agent loops stop paying for the same
+        tool dump every turn. Everything else — ``function_call``,
+        ``reasoning``, images, plain strings — passes through untouched.
+
+        M3: the level applied per item is policy-gated, so a ``system``/
+        ``developer`` message item is capped at lossless L1 (instructions are
+        never rewritten) while tool outputs may reach L3 head/tail truncation.
+        """
+        compact = self.pipeline.normalizer.compact_text
+        policy = result.policy or CompressionPolicy()
+        if isinstance(input_value, str):
+            # A bare string input is the user's ask: HIGH authority, capped L2.
+            decision = policy.level_for(input_value, role="user")
+            return compact(input_value, level=int(decision.level))
+        if not isinstance(input_value, list):
+            return input_value
+        out: List[Any] = []
+        prev_output_key: Optional[str] = None
+        for item in input_value:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+            kind = item.get("type")
+            if kind == "message":
+                # The item's role (system/developer/user/assistant) decides the
+                # authority cap; instructions are capped at lossless L1.
+                decision = policy.level_for("", role=str(item.get("role", "")))
+                mlevel: Optional[int] = int(decision.level)
+                content = item.get("content")
+                if isinstance(content, str):
+                    item = {**item, "content": compact(content, level=mlevel)}
+                elif isinstance(content, list):
+                    item = {**item, "content": [
+                        {**p, "text": compact(p["text"], level=mlevel)}
+                        if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                        for p in content
+                    ]}
+                out.append(item)
+                prev_output_key = None  # not consecutive with a previous output
+            elif kind == "function_call_output":
+                output = item.get("output")
+                key = json.dumps(output, sort_keys=True, ensure_ascii=False, default=str)
+                if key == prev_output_key and len(key) > 200:
+                    # Consecutive exact repeat of a *substantial* output: keep
+                    # the item (call ids differ) but drop the payload behind
+                    # the same never-silently-delete marker CDM uses.
+                    out.append({**item, "output": "[cdm: duplicate of previous tool output elided]"})
+                else:
+                    if isinstance(output, str):
+                        item = {**item, "output": compact(output, tool=True)}
+                    elif isinstance(output, list):
+                        item = {**item, "output": [
+                            {**p, "text": compact(p["text"], tool=True)}
+                            if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                            for p in output
+                        ]}
+                    out.append(item)
+                    prev_output_key = key
+            else:
+                out.append(item)
+                prev_output_key = None  # only tool outputs may repeat consecutively
+        return out
+
     def _forward(
         self,
         payload: Dict[str, Any],
@@ -737,6 +1394,9 @@ class _Handler(BaseHTTPRequestHandler):
         protocol: str = "openai",
         endpoint: str = "",
         started: Optional[float] = None,
+        tier: str = "",
+        secrets_detected: int = 0,
+        secrets_redacted: int = 0,
     ) -> None:
         forwarded = dict(payload)
         # Session Governor: a stable prompt_cache_key (the session id) tells the
@@ -756,14 +1416,21 @@ class _Handler(BaseHTTPRequestHandler):
             # The Gemini wire speaks `contents`, not `messages`. Compact each
             # text part in place; non-text parts (inline_data, function_call)
             # and the generationConfig/systemInstruction envelope pass through
-            # untouched — flattening them would corrupt the request.
+            # untouched — flattening them would corrupt the request. The system
+            # instruction travels separately (untouched); contents roles are
+            # user/model, both capped L2 by policy.
+            gpolicy = result.policy or CompressionPolicy()
             contents = []
             for c in payload.get("contents") or []:
+                gdecision = gpolicy.level_for("", role=str(c.get("role", "user")))
+                glevel: Optional[int] = int(gdecision.level)
                 parts = []
                 for part in c.get("parts") or []:
                     if isinstance(part, dict) and isinstance(part.get("text"), str):
                         parts.append(
-                            {**part, "text": self.pipeline.normalizer.compact_text(part["text"])}
+                            {**part, "text": self.pipeline.normalizer.compact_text(
+                                part["text"], level=glevel
+                            )}
                         )
                     elif isinstance(part, dict):
                         parts.append(part)
@@ -794,8 +1461,19 @@ class _Handler(BaseHTTPRequestHandler):
                 headers.pop("authorization", None)
             headers.setdefault("anthropic-version", self.headers.get("anthropic-version", "2023-06-01"))
         else:
-            forwarded["messages"] = list(result.messages)
-            url = self.config.upstream_base.rstrip("/") + "/chat/completions"
+            if endpoint == "responses":
+                # Responses API wire: compact text parts in place (same
+                # noise-stripping the chat wire gets) and collapse exact-repeat
+                # tool outputs; typed items (function_call, reasoning, images)
+                # pass through untouched — flattening them would corrupt the
+                # request. Compaction is deterministic, so the prefix stays
+                # byte-stable and the provider's prompt cache can hit.
+                forwarded["input"] = self._compact_responses_input(payload.get("input"), result)
+                forwarded.pop("messages", None)
+                url = self.config.upstream_base.rstrip("/") + "/responses"
+            else:
+                forwarded["messages"] = list(result.messages)
+                url = self.config.upstream_base.rstrip("/") + "/chat/completions"
             if self.config.api_key:
                 headers["Authorization"] = f"Bearer {self.config.api_key}"
         self._finalize_headers(headers)
@@ -851,21 +1529,25 @@ class _Handler(BaseHTTPRequestHandler):
                 err = json.loads(last_detail)
             except ValueError:
                 err = {"error": {"message": last_detail[:500], "type": "upstream_error"}}
-            self._send_json(last_status, err)
             self._record_receipt(
                 payload, result, route="llm", status=last_status,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
             )
+            self._send_json(last_status, err)
             return
 
-        extra = self._route_headers(result)
+        extra = self._route_headers(result, secrets_redacted=secrets_redacted)
         if fallback_note:
             extra["X-Optimizer-Fallback"] = fallback_note
 
         if payload.get("stream") or endpoint == "generate_content_stream":
-            self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
+            streamed = self._relay_stream(upstream_resp, result, protocol=protocol, extra=extra)
             # Streaming: the relay loop IS the generation, so it's all upstream.
             upstream_ms = (time.perf_counter() - upstream_start) * 1000
             self._record_receipt(
@@ -873,6 +1555,11 @@ class _Handler(BaseHTTPRequestHandler):
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
+                response_text=streamed,
             )
             return
 
@@ -882,13 +1569,17 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             parsed = json.loads(body.decode("utf-8"))
         except ValueError:
-            self._send_json(502, {"error": {"message": "upstream returned non-JSON", "type": "upstream_error"}})
             self._record_receipt(
                 payload, result, route="llm", status=502,
                 ms=(time.perf_counter() - started) * 1000 if started else 0.0,
                 upstream_ms=upstream_ms,
                 fallback=fallback_note,
+                protocol=protocol,
+                tier=tier,
+                secrets_detected=secrets_detected,
+                secrets_redacted=secrets_redacted,
             )
+            self._send_json(502, {"error": {"message": "upstream returned non-JSON", "type": "upstream_error"}})
             return
 
         self.pipeline.record_llm(result, parsed, protocol=protocol)
@@ -899,18 +1590,27 @@ class _Handler(BaseHTTPRequestHandler):
         # Doc Governor: attach the retrieval economics to the answer body.
         if result.doc_savings is not None:
             parsed["optimizer"] = self._doc_meta(result)
-        self._send_json(200, parsed, extra=extra)
+        # Record BEFORE responding — see the local-path note: receipts must
+        # stay in completion order even when the next request is already
+        # racing in on another thread.
         self._record_receipt(
             payload, result, route="llm", status=200,
             ms=(time.perf_counter() - started) * 1000 if started else 0.0,
             upstream_ms=upstream_ms,
             upstream_cached=cached, fallback=fallback_note,
+            protocol=protocol,
+            tier=tier,
+            secrets_detected=secrets_detected,
+            secrets_redacted=secrets_redacted,
+            response_text=self.pipeline._extract_content(parsed, protocol=protocol) or "",
         )
+        self._send_json(200, parsed, extra=extra)
 
     def _relay_stream(
         self, upstream_resp: Any, result: PipelineResult, *, protocol: str = "openai",
         extra: Optional[Dict[str, str]] = None,
-    ) -> None:
+    ) -> str:
+        """Relay the SSE stream; return the buffered answer text (may be "")."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         for key, value in {**self._route_headers(result), **(extra or {})}.items():
@@ -971,6 +1671,58 @@ class _Handler(BaseHTTPRequestHandler):
             answer = _extract_streamed_text(buffered, protocol)
             if answer:
                 self.pipeline.cache.set(result.cache_key, answer)
+        return answer
+
+
+def _last_payload_message(payload: Dict[str, Any], protocol: str) -> Optional[Tuple[str, str]]:
+    """Newest (role, text) from the *original* wire payload, any protocol.
+
+    The conversation store keeps original bytes — never the digest-scrubbed
+    view the cache sees. Returns None when the payload carries no message
+    text at all.
+    """
+    def _parts_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            bits = []
+            for part in content:
+                if isinstance(part, dict):
+                    for key in ("text", "content"):
+                        val = part.get(key)
+                        if isinstance(val, str):
+                            bits.append(val)
+                            break
+            return "\n".join(bits)
+        return ""
+
+    items: Sequence[Any] = []
+    if protocol == "gemini":
+        items = payload.get("contents") or []
+    elif protocol == "anthropic":
+        items = payload.get("messages") or []
+    elif isinstance(payload.get("input"), list):  # openai responses
+        items = payload["input"]
+    else:  # openai chat
+        items = payload.get("messages") or []
+    for item in reversed(list(items)):
+        if not isinstance(item, dict):
+            continue
+        if protocol == "gemini":
+            role = item.get("role", "user")
+            text = "\n".join(
+                str(p.get("text", "")) for p in item.get("parts") or [] if isinstance(p, dict)
+            )
+        elif isinstance(item.get("type"), str) and item.get("type") == "message":
+            # Responses input item: {"type": "message", "role": ..., "content": [...]}
+            role = str(item.get("role", "user"))
+            text = _parts_text(item.get("content"))
+        else:
+            role = str(item.get("role", ""))
+            text = _parts_text(item.get("content"))
+        if text:
+            return (role or "user"), text
+    return None
 
 
 def _is_model_rejection(status: int, detail: str) -> bool:
@@ -1026,6 +1778,9 @@ def _extract_streamed_usage(buffered: str, protocol: str) -> Dict[str, Any]:
                 usage.update(obj["usage"])
         elif isinstance(obj.get("usage"), dict):
             usage.update(obj["usage"])
+        elif isinstance((obj.get("response") or {}).get("usage"), dict):
+            # Responses API: usage rides inside the response.completed event.
+            usage.update(obj["response"]["usage"])
     return usage
 
 
@@ -1033,10 +1788,11 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
     """Pull the assistant's answer out of relayed SSE frames.
 
     Raw ``data: {...}`` lines must never reach the cache — only the text the
-    model actually produced. Handles all three wire formats:
+    model actually produced. Handles all four wire formats:
       * openai    → choices[0].delta.content
       * anthropic → content_block_delta delta.text
       * gemini    → candidates[0].content.parts[].text
+      * responses → response.output_text.delta events
     """
     parts: List[str] = []
     for line in buffered.splitlines():
@@ -1066,6 +1822,12 @@ def _extract_streamed_text(buffered: str, protocol: str) -> str:
                 if block.get("type") == "text":
                     parts.append(block.get("text", ""))
         else:
+            if obj.get("type") == "response.output_text.delta":
+                # Responses API: text rides in typed events, not `choices`.
+                delta = obj.get("delta")
+                if isinstance(delta, str):
+                    parts.append(delta)
+                continue
             choices = obj.get("choices") or []
             if choices:
                 delta = choices[0].get("delta") or {}
@@ -1095,6 +1857,23 @@ class TokenOptimizerProxy:
         self.pipeline = pipeline or OptimizationPipeline.with_cdn()
         # Rolling per-request receipts, shared across handler instances.
         self.receipts: Deque[Dict[str, Any]] = deque(maxlen=self.config.receipt_window)
+        # Conversation memory (observe-only): a misconfigured store must never
+        # take the gateway down — warn once and serve on.
+        self.store: Optional[ConversationStore] = None
+        if self.config.conversation_db:
+            try:
+                self.store = ConversationStore(self.config.conversation_db)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"[tokan] conversation store unavailable ({exc}); serving without", flush=True)
+        # M6 routing (opt-in): the Adaptive Task Router only classifies unless
+        # the operator set --tier1_model (see ProxyConfig.tier1_model).
+        self._task_router = None
+        if self.config.task_router:
+            from ..task_router import AdaptiveTaskRouter
+
+            self._task_router = AdaptiveTaskRouter(
+                low_cost_model=self.config.tier1_model or "gpt-4o-mini"
+            )
 
         outer = self
 
@@ -1102,6 +1881,8 @@ class TokenOptimizerProxy:
             pipeline = outer.pipeline
             config = outer.config
             receipts = outer.receipts
+            store = outer.store
+            _task_router = outer._task_router
 
         self._server = _GatewayServer((self.config.host, self.config.port), Handler)
         self._thread: Optional[threading.Thread] = None
@@ -1161,6 +1942,8 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--cache-db", default=None, help="sqlite file for a persistent edge cache")
     parser.add_argument("--fallback-model", default=None, help="retry once with this model on model_not_supported")
     parser.add_argument("--log-requests", action="store_true", help="print one receipt line per request")
+    parser.add_argument("--conversation-db", default=None,
+                        help="sqlite file for the append-only conversation store (observe-only)")
     args = parser.parse_args(argv)
     try:
         upstream, extra_headers, fallback_headers = resolve_upstream_flags(args)
@@ -1185,6 +1968,7 @@ def main(argv: Optional[list] = None) -> None:
             fallback_headers=fallback_headers,
             fallback_model=args.fallback_model,
             log_requests=args.log_requests,
+            conversation_db=args.conversation_db,
         ),
         pipeline,
     )
