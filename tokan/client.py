@@ -7,6 +7,7 @@
     print(response.metrics["saved_percent"])
 
 Same pipeline as the gateway proxy, invoked in-process.
+Also used by the benchmarks and the VS Code extension entry points.
 """
 from __future__ import annotations
 
