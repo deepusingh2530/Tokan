@@ -33,7 +33,7 @@ POSITIVES = {
     "slack_token": "xoxb-" + "1" * 20 + "-" + "a" * 20,
     "stripe_key": "sk_live_" + "T" * 24,
     "npm_token": "npm_" + "a1B2" * 9,
-    "jwt": ("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+    "jwt": (process.env.JWT_SECRET
             "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
     "private_key_block": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCA...",
 }
